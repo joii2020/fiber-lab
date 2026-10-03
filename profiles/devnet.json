@@ -1,0 +1,19 @@
+{
+  "offckb_entry": ".tools/offckb/build/index.js",
+  "state_dir": ".state/devnet",
+  "rust_log": "info,fnn=debug",
+  "nodes": [
+    {"id": 1, "binary": "../fiber/target/release/fnn", "args": []},
+    {
+      "id": 2,
+      "binary": "../fiber/target/release/fnn",
+      "lsp": true,
+      "biscuit_public_key": "ed25519/17b172749be74276f0ed35a5d0685752684a3c5722114bba447a2f301136db79",
+      "biscuit_private_key": "../fiber/tests/nodes/biscuit-test-private-key",
+      "operator_token_file": "../fiber/tests/bruno/environments/test.bru",
+      "operator_token_key": "LSP_OPERATOR_TOKEN",
+      "auto_accept_shannons": 50000000000,
+      "args": []
+    }
+  ]
+}
