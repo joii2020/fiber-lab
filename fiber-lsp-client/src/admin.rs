@@ -1,5 +1,4 @@
 use std::{
-    env,
     fs::{self, OpenOptions},
     io::Read,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
@@ -19,7 +18,7 @@ pub const PERMISSIONS: &str = "read(\"lsp\"); write(\"lsp\"); read(\"node\");";
 
 #[derive(Args)]
 #[command(
-    after_help = "默认离线读取 offckb Node3 的实际配置，无需启动 LSP 或复制 configs/lsp.yml。\n相对路径均相对于当前工作目录。私钥必须是仅当前用户可访问的普通文件。\n目标已存在（含符号链接）时拒绝覆盖。权限不包含 write(\"node\")。"
+    after_help = "默认离线读取 offckb Node3 的实际配置，无需启动 LSP。\n相对路径均相对于当前工作目录。私钥必须是仅当前用户可访问的普通文件。\n目标已存在（含符号链接）时拒绝覆盖。权限不包含 write(\"node\")。"
 )]
 pub struct CreateToken {
     /// 配置路径；默认 ${XDG_DATA_HOME:-$HOME/.local/share}/offckb-nodejs/devnet/fiber/nodes/3/config.yml
@@ -48,27 +47,8 @@ fn output_path(options: &CreateToken) -> Result<PathBuf> {
         .unwrap_or_else(|| root.join("configs/keys/operator-token")))
 }
 
-fn node3_config(
-    xdg: Option<std::ffi::OsString>,
-    home: Option<std::ffi::OsString>,
-) -> Result<PathBuf> {
-    let data = match xdg.filter(|value| !value.is_empty()) {
-        Some(value) => PathBuf::from(value),
-        None => PathBuf::from(
-            home.filter(|value| !value.is_empty())
-                .context("未设置 HOME；请指定 --config")?,
-        )
-        .join(".local/share"),
-    };
-    Ok(data.join("offckb-nodejs/devnet/fiber/nodes/3/config.yml"))
-}
-
 pub fn create_token(options: &CreateToken) -> Result<CreatedToken> {
-    let config = match &options.config {
-        Some(path) => path.clone(),
-        None => node3_config(env::var_os("XDG_DATA_HOME"), env::var_os("HOME"))?,
-    };
-    let config = std::path::absolute(config)?;
+    let config = crate::rpc::config_path(options.config.as_deref())?;
     let output = std::path::absolute(output_path(options)?)?;
 
     #[derive(Deserialize)]
@@ -182,20 +162,6 @@ mod tests {
         assert_eq!(
             output_path(&options).unwrap(),
             client_root.join("configs/keys/operator-token")
-        );
-    }
-
-    #[test]
-    fn default_config_needs_home_only_without_xdg() {
-        assert_eq!(
-            node3_config(Some("/data".into()), None).unwrap(),
-            PathBuf::from("/data/offckb-nodejs/devnet/fiber/nodes/3/config.yml")
-        );
-        assert!(
-            node3_config(None, None)
-                .unwrap_err()
-                .to_string()
-                .contains("--config")
         );
     }
 }

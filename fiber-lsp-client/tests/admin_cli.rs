@@ -308,6 +308,8 @@ fn help_requires_no_configuration_or_accounts() {
         vec!["--help"],
         vec!["admin", "--help"],
         vec!["admin", "create-token", "--help"],
+        vec!["create-user", "--help"],
+        vec!["status", "--help"],
     ] {
         let result = Command::new(env!("CARGO_BIN_EXE_fiber-lsp-client"))
             .current_dir(temp.path())

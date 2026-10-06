@@ -1,292 +1,185 @@
 # fiber-lab
 
-本地 Fiber LSP 联调环境与 **Fiber LSP 联调工具**：offckb 使用本地编译的 `fnn` 启动 CKB devnet 和普通 Fiber 节点，Shell 单独启动 LSP；`lsp-cli` 提供管理操作与客户端操作，客户端通过 LSP RPC 注册用户，使用本地 `fiber-lsp-sdk` 管理身份和签名。
+本地 Fiber LSP 联调环境，使用 `lsp-cli` 创建、恢复客户端账户并查询通道。
 
-**当前可用：启动 devnet / LSP、离线签发管理 token、创建和恢复客户端账户、查询通道数量。客户端开通道、付款和收款尚未实现。** 下文先给出可执行的启动步骤，再说明客户端完成一笔付款和收款需要的最短流程。
+按下文可以跑完当前已实现的流程：**准备环境 → 生成管理凭证 → 启动 LSP → 注册账户 → 开通道 → 查询通道 → 协作关闭 → 停止或重启**。客户端已支持开通道、协作关闭和独立通道查询；付款和收款尚未实现，相关设计见 [收付款流程](docs/payment-flow.md)。
 
-## 1. 启动 Fiber LSP devnet
+## 快速开始（首次配置）
 
-依赖：**offckb 0.5.0**、Node.js 20+、Rust 工具链，以及 `curl`、`jq`。
+以下命令均在 `fiber-lab` 根目录执行，首次配置步骤使用同一个 Shell。已有环境请直接看 [启动和状态检查](#5-启动和状态检查)。
+
+`lsp-cli` 默认直接读取 offckb Node3 的配置，自动获取命令所需的信息。首次使用仍需手动生成 Biscuit 密钥并配置 LSP，再执行管理 token 签发命令；具体操作见步骤 3 和 4。
+
+### 1. 安装依赖并编译
+
+- Node.js 20+
+- Rust 工具链
+- `curl`
+- `jq`
+
+Fiber 源码默认放在同级目录 `../fiber`，必须包含 LSP 实现和 `crates/fiber-lsp-sdk`；
+编译所需的系统依赖见 [Fiber README](../fiber/README.md)。
 
 ```bash
-npm i -g @offckb/cli@0.5.0-canary-ee0ad6b
-offckb --version
-```
-(目前 offckb 0.5.0 还处于 canary)
-
-Fiber 源码默认位于同级目录 `../fiber`，必须包含本项目使用的 LSP 实现和 `crates/fiber-lsp-sdk`。offckb 默认下载的普通 FNN 不能替代这里本地编译的 LSP。Fiber 的编译依赖见其 [README](../fiber/README.md)。以下命令都在 `fiber-lab` 根目录执行。
-
-### 编译
-
-脚本依次编译 Fiber 的 `fnn` 和 `fiber-lsp-client`。编译完成后，项目根目录会有 `./lsp-cli` 入口，方便直接进行管理与客户端联调。
-
-```bash
-bash scripts/build-fiber.sh
+./scripts/build-fiber.sh
 ```
 
-- `./lsp-cli` 这里的软链只是便于使用。
-- lsp-cli 关于 `fiber-lsp-sdk` 和 `fiber-json-types`  的依赖使用本地路径。
-- 若更换 Fiber 源码目录，需要同步修改 `scripts/config.sh` 的 `FNN_BINARY` 和 `fiber-lsp-client/Cargo.toml` 的两个依赖路径，再重新编译。
+成功后，`./lsp-cli --help` 会列出 `admin`、`create-user`、`status`、`openchannel`、`closechannel` 和 `listChannel`。
+更换 Fiber 源码目录的方式见 [编译与本地依赖](docs/devnet.md#编译与本地依赖)。
 
-### 首次初始化三个 Fiber 节点
+### 2. 初始化节点
 
-本节使用 **Node1、Node2 作为普通节点，Node3 作为 LSP**。
-先由 offckb 启动三个普通节点，自动生成当前 devnet 的链、合约、RPC、端口、CKB 私钥和密码，再停止 Fiber，将 Node3 改成 LSP。
-（CKB 在配置期间继续运行，不需要手动填合约哈希或导入 CKB 私钥。）
+先用 offckb 初始化 CKB devnet 和三个 Fiber 节点。offckb 会生成链与合约配置、节点 RPC 地址，并配置带资金的 CKB 出资账户，供 LSP 公共节点（Public T）等节点使用。
 
-以下命令用于首次初始化。在同一个 Shell 中执行，并保持工作目录为项目根目录：
+随后将 Node3 改为 LSP；Node1、Node2 继续由 offckb 管理，Node3 由 Shell 单独启动：
 
 ```bash
 source scripts/config.sh
 
-# 启动 CKB devnet；首次运行会下载 CKB 并创建链数据
 offckb node --daemon
-
-# 生成并启动三个普通 Fiber 节点
 offckb fiber start --nodes 3 --binary-path "$FNN_BINARY" --daemon
 offckb fiber status
-
-# 停止三个 Fiber 节点，保留配置、密钥和数据；CKB 继续运行
 offckb fiber stop
 ```
 
-### 将 Node3 配置为 LSP
+### 3. 配置 Node3 / LSP
 
-编辑 `$LSP_DIR/config.yml`，修改以下项：
-
-1. 在 `services` 中增加 `lsp`。
-2. 在 `rpc.enabled_modules` 中增加 `lsp`、`pubsub`。
-3. 生成一对 Biscuit 密钥，并将公钥填入 `rpc.biscuit_public_key`。在项目根目录执行：
-
-   如需安装 Biscuit，执行 `cargo install biscuit-cli`。
+生成一对密钥：
 
 ```bash
-   biscuit keypair
+biscuit keypair
 ```
 
-   将输出的 `Public key` 完整值（含 `ed25519/` 前缀）填入配置。
-
-4. 将同一次输出的 `Private key` 完整值保存到 `$LSP_DIR/biscuit-private-key`，即 Node3 数据目录下的 `nodes/3/biscuit-private-key`。获取其绝对路径，填入 `rpc.biscuit_private_key_path`：
-
-   ```bash
-   chmod 600 "$LSP_DIR/biscuit-private-key"
-   realpath "$LSP_DIR/biscuit-private-key"
-   ```
-
-   将 `realpath` 的输出填入配置。私钥文件包含完整的 `ed25519-private/<私钥>` 字符串，不包含 `Private key:` 标签。
-
-5. 将 `fiber.announced_node_name` 设置为 `fiber-lab-lsp`。 （便于后续调试）
-
-### 启动前两个普通节点，再单独启动 Node3
-
-完成首次配置后，用启动脚本启动 CKB、两个普通节点和 Node3 / LSP：
+用编辑器新建 `$LSP_DIR/biscuit-private-key`，只保存本次输出的完整 `Private key` 值：保留 `ed25519-private/` 前缀，去掉 `Private key:` 标签。然后执行：
 
 ```bash
-bash scripts/start.sh
+chmod 600 "$LSP_DIR/biscuit-private-key"
 ```
 
-脚本使用 `offckb fiber start --nodes 2` 管理普通节点，再用 `nohup` 单独启动 Node3，复用其目录中的配置、密码和密钥，并将 PID 保存到 `.state/devnet/lsp.pid`。脚本要求首次配置已完成，不生成或复制 LSP 密钥。
+编辑 `$LSP_DIR/config.yml`，保留已有配置，只修改以下项：
 
-`--nodes 2` 会将 Node3 移出 `fiber/nodes.yml` 的管理列表，保留其目录，且只重新生成前两个节点的配置。**配置为 LSP 后，不要再用 `--nodes 3` 或 `--fiber-nodes 3` 启动它**，否则 offckb 会覆盖 Node3 的配置并将它作为普通节点启动。后续重启跳过首次初始化步骤，直接使用启动脚本。
+- `services`：在原列表中增加 `lsp`。
+- `rpc.enabled_modules`：在原列表中增加 `lsp`、`pubsub`。
+- `rpc.biscuit_public_key`：填入本次输出的完整 `Public key` 值，含 `ed25519/` 前缀，不含 `Public key:` 标签。
+- `rpc.biscuit_private_key_path`：填入上面 `realpath "$LSP_DIR/biscuit-private-key"` 输出的私钥文件绝对路径。
+- `fiber.announced_node_name`：设置为 `fiber-lab-lsp`。 (非必要，便于使用)
 
-| 服务 | RPC | Fiber P2P | CKB 账户 |
-| --- | --- | --- | --- |
-| CKB devnet | `http://127.0.0.1:8114` | — | — |
-| 普通 Fiber Node1 | `http://127.0.0.1:21714` | `8344` | `#3` |
-| 普通 Fiber Node2 | `http://127.0.0.1:21715` | `8345` | `#4` |
-| LSP / Node3 | `http://127.0.0.1:21716` | `8346` | `#5` |
+密钥与配置方式见 [Biscuit 凭证](docs/biscuit-auth.md)。
 
+### 4. 生成管理Token
 
-### 生成 RPC 管理凭证
-
-在项目根目录执行管理命令，用配置 Node3 时保存的私钥离线签发管理 token：
+命令自动读取 Node3 配置中的 `rpc.biscuit_public_key` 和 `rpc.biscuit_private_key_path`，离线签发管理 token。默认无需传入公钥或私钥路径，也无需启动 LSP：
 
 ```bash
 ./lsp-cli admin create-token
 ```
 
-该命令直接读取 `${XDG_DATA_HOME:-$HOME/.local/share}/offckb-nodejs/devnet/fiber/nodes/3/config.yml`，以及其中 `rpc.biscuit_private_key_path` 指向的私钥文件；无需启动 LSP、`source scripts/config.sh` 或提前复制 `configs/lsp.yml`，也不要求配置 RPC 地址。私钥必须由当前用户拥有、仅当前用户可访问，保存完整 `ed25519-private/...` 字符串（允许末尾换行）；签发前会检查公私钥是否匹配。
+成功后会提示凭证已保存到 `configs/keys/operator-token`。
+已有凭证时直接复用，重启无需再次生成。其他参数和权限说明见 [管理凭证签发](docs/biscuit-auth.md#管理凭证签发)。
 
-默认保存到项目内 `configs/keys/operator-token`，文件权限为 `600`。已有文件或符号链接目标会被拒绝，不覆盖、不自动轮换。成功输出实际配置路径、保存路径和权限，不显示私钥或 token 正文。固定权限为：
-
-```text
-read("lsp");
-write("lsp");
-read("node");
-```
-
-这允许读写 LSP、读取节点信息，不授予 `write("node")`。密钥和 token 的生成只在首次配置时执行，重启复用原文件。公钥、私钥和管理 token 必须匹配；接口说明见 Fiber 的 [Biscuit 文档](../fiber/docs/biscuit-auth.md)。
-
-三个参数均为可选覆盖项，用于联调其他配置或保存独立的测试凭证：
+### 5. 启动和状态检查
 
 ```bash
-./lsp-cli admin create-token --help
-./lsp-cli admin create-token \
-  --config /path/to/node/config.yml \
-  --private-key-file /path/to/biscuit-private-key \
-  --output configs/keys/test-operator-token
+bash scripts/start.sh
 ```
 
-`--config` 覆盖默认 Node3 配置，缺失或无效时直接报错；仍需其中的 `rpc.biscuit_public_key`。`--private-key-file` 覆盖配置内私钥路径；未指定且配置字段缺失时，需补齐字段或指定参数。`--output` 覆盖默认保存位置。所有显式相对路径（包括配置内的私钥路径）均相对于当前工作目录；教程使用私钥绝对路径。
+启动脚本会先检查 CKB RPC；已有 CKB 正常运行时直接复用，因此首次配置后只停止 Fiber、保留 CKB 运行也可以直接执行。
 
-<details>
-<summary>原理：通过 biscuit CLI 签发的等价操作</summary>
+**Node3 配置为 LSP 后，不要再用 `--nodes 3` 或 `--fiber-nodes 3` 启动，以免覆盖其配置。后续统一使用 `scripts/start.sh`。**
 
-以下权限文件和 Shell 命令与管理命令签发的权限相同。两种方式选择一种执行，仅在尚未创建凭证时使用；Shell 重定向会覆盖已有文件。此示例沿用初始化 Shell 中的 `$LSP_DIR`：
-
+状态检查：
 ```bash
-mkdir -p .state configs/keys
-cat > .state/operator-permissions.bc <<'EOF'
-read("lsp");
-write("lsp");
-read("node");
-EOF
-
-(umask 077; biscuit generate \
-  --private-key "$(cat "$LSP_DIR/biscuit-private-key")" \
-  .state/operator-permissions.bc > configs/keys/operator-token)
-```
-
-管理命令在 Rust 中使用相同的 Biscuit 权限构造和 Base64 编码，避免在主流程中通过 Shell 命令行传递私钥。`biscuit-cli` 仍用于上文的 `biscuit keypair` 密钥生成。
-
-</details>
-
-### 确认就绪
-
-```bash
-# 确认 CKB 和 offckb 管理的前两个节点
 offckb fiber status
 
-# 确认单独启动的 LSP；必须携带管理凭证
 curl --noproxy '*' -fsS http://127.0.0.1:21716 \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $(cat configs/keys/operator-token)" \
   --data '{"jsonrpc":"2.0","id":1,"method":"lsp_get_status","params":[]}' \
   | jq -e 'if .error then error(.error.message) else .result end'
-
-# 核对实际出资账户
-curl --noproxy '*' -fsS http://127.0.0.1:21716 \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $(cat configs/keys/operator-token)" \
-  --data '{"jsonrpc":"2.0","id":1,"method":"node_info","params":[]}' \
-  | jq -e 'if .error then error(.error.message) else .result | {pubkey, default_funding_lock_script} end'
 ```
 
-`lsp_get_status` 成功结果包含 `public_node_id`、`registered_tenants` 和 `active_tenants`。将 `default_funding_lock_script` 与 `offckb accounts` 的账户 `#5` 对照；其 `args` 应为 `0x0df9552f53d51a378aba267bc858dada447e8400`。`pubkey` 是 Public T 的 Fiber 身份公钥。
+`offckb fiber status` 应显示两个普通节点在运行；LSP RPC 应返回包含 `public_node_id`、`registered_tenants` 和 `active_tenants` 的结果。若 LSP 还在初始化，稍后重试 RPC；失败时查看 [故障排查](docs/troubleshooting.md)。
 
-启动脚本写入 PID 不代表 LSP 已经就绪；连接失败时查看 `.state/devnet/lsp.log`，待初始化完成后重试 RPC。启动服务不会自动注册客户端、连接普通节点与 LSP，或建立支付通道。
-
-### 查看日志、停止和重启
+使用完后停止环境：
 
 ```bash
-tail -f .state/devnet/lsp.log
-
-# 停止手动启动的 LSP，再停止普通 Fiber 节点和 CKB；保留数据
 bash scripts/stop.sh
 ```
 
-重启时，在项目根目录执行 `bash scripts/start.sh`，不再执行初始化三个普通节点的步骤。`stop.sh` 根据保存的 PID 停止 `nohup` 启动的 LSP，删除 PID 文件，再停止 offckb 管理的普通 Fiber 节点和 CKB。
+停止会保留已有数据，下次使用时重新执行 `bash scripts/start.sh`。
 
-CKB 和节点数据位于 `${XDG_DATA_HOME:-$HOME/.local/share}/offckb-nodejs/devnet/`；LSP 使用其中的 `fiber/nodes/3/`。停止和重启保留这些数据，密码与加密后的 CKB 密钥需要一起保留。
-
-已有 Node4 数据保留，不自动迁移或清理。项目客户端使用同步后的 `configs/lsp.yml` 连接 Node3；原先关联 Node4 的客户端账户也不自动迁移。
-
-### 首次启动失败时
-
-- offckb 不识别 Fiber 命令或参数：核对安装版本以及 `offckb fiber start --help`。
-- 找不到 `fnn` 或 `fiber-lsp-sdk`，或 LSP 服务不可用：检查同级 Fiber 源码、编译结果和 `FNN_BINARY` 路径。
-- 首次下载 CKB 失败：查看 offckb 输出，确认下载源可访问。
-- 端口已占用或节点已经运行：用 `offckb fiber status` 查看现有服务，先停止对应服务再启动。
-- LSP 退出或 RPC 拒绝访问：查看 `.state/devnet/lsp.log`，核对 Node3 的密码、Biscuit 密钥对、私钥绝对路径及管理凭证。
-
-合约和链配置由首次运行的 offckb 自动生成；排查时保留已有数据，不要用清理 devnet 来替代配置检查。
-
-## 2. 使用 Fiber LSP 联调工具
-
-`lsp-cli admin create-token` 是 LSP 操作者的管理命令；`create-user` 和 `status` 是客户端命令。管理命令显式读取服务端私钥，客户端命令只读取所需的管理 token 或用户凭证，不读取服务端私钥，也不自动签发管理 token。
-
-确认 LSP RPC 就绪后，在项目根目录同步 LSP 配置，供客户端读取 RPC 地址和 Biscuit 公钥。以下命令沿用启动步骤中设置的 `$LSP_DIR`：
+### 6. 注册账户并查询通道
 
 ```bash
-cp "$LSP_DIR/config.yml" configs/lsp.yml
-```
-
-然后执行以下命令，测试账户创建和通道查询：
-
-```bash
-# 查看命令说明
-./lsp-cli --help
-
-# 创建或恢复客户端账户
+# 首次注册；已有完整账户时恢复原账户
 ./lsp-cli create-user
 
-# 查询当前账户的通道数量
-./lsp-cli status
+# 独立查询当前账户的通道（只读）
+./lsp-cli listChannel
 ```
 
-直接执行 `./lsp-cli` 或使用 `-h` / `--help` 都会显示用法、命令和选项说明，无需连接 LSP。
+`create-user` 和 `status` 默认直接从 offckb Node3 的 `config.yml` 读取 RPC 地址和 Biscuit 公钥，无需复制配置。默认路径为 `${XDG_DATA_HOME:-$HOME/.local/share}/offckb-nodejs/devnet/fiber/nodes/3/config.yml`，与管理 token 签发命令一致。
 
-`create-user` 首次生成身份并注册到 LSP，已有完整账户时恢复原账户；`status` 恢复账户并用用户凭证查询自己的通道。两个命令都输出身份公钥、`tenant_id` 和通道数量。刚注册时通道数量为 `0`，还需要开通道才能收付款。
+首次执行 `create-user` 时，SDK 自动生成并保存客户端身份和 `tenant_id`；客户端通过 RPC 获取 LSP 身份公钥、注册随机数和注册成功后的用户凭证。注册使用步骤 4 保存的管理 token，账户恢复后的通道查询使用已保存的用户凭证。
 
-客户端自动读取 `configs/lsp.yml` 的 RPC 地址和 Biscuit 公钥，注册时读取 `configs/keys/operator-token`，后续使用已保存的用户凭证。首次注册使用管理凭证是当前实验环境的接入方式：由联调操作者执行注册，服务端返回用户凭证，用户后续操作使用该凭证。两者职责不同，面向普通用户的注册服务不在本期范围。重启时复用管理 token 和完整账户中的用户凭证。
+需要使用其他节点配置时，相关命令均可传入 `--config PATH`，相对路径以当前工作目录为准：
 
-账户保存在 `.state/fiber-lsp-client/default/`，当前只支持一个账户，无需额外配置参数。
+```bash
+./lsp-cli admin create-token --config /path/to/node/config.yml
+./lsp-cli create-user --config /path/to/node/config.yml
+./lsp-cli status --config /path/to/node/config.yml
+```
 
-## 3. 客户端最快完成一笔付款和收款
+`--config` 只改变读取的配置文件，管理 token 和默认账户仍保存在项目目录。已有账户需要使用与保存记录一致的 RPC 地址和 Biscuit 公钥。
 
-**本节是待实现的客户端使用流程，下面的 `open-channel`、`pay`、`create-invoice`、`watch` 命令当前还不能执行。** 现有客户端命令只有 `create-user` 和 `status`，还不能完成端到端支付。
+`create-user` 和 `status` 都会输出身份公钥、`tenant_id` 和通道数量。首次注册成功后，通道数量应为 `0`；再次执行时，身份公钥和 `tenant_id` 应保持一致。之后使用下节的通道命令完成链上生命周期。
 
-最短联调路径是：
+`create-user` 和 `status` 运行时执行 `offckb --json accounts`，读取约定的默认出资账户 `offckb #5`。命令成功后，打印获取到的编号、lock args 和 address，便于对照排查。普通 devnet 的输出示例：
 
 ```text
-普通 Fiber 节点 ⇄ LSP ⇄ 客户端用户的私有通道
+默认出资账户：offckb #5
+出资 lock args：0x0df9552f53d51a378aba267bc858dada447e8400
+出资 address：ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqgdl92j7574rgmc4w3x00y93kk6g3lggqq23mmmd
 ```
 
-先准备普通节点与 LSP 之间的可用通道，再为客户端开一条到 LSP 的私有通道。付款需要客户端一侧有可用余额，收款需要 LSP 一侧有可用余额；两个方向都要扣除通道保留金额和所需费用。第一次演示建议固定支付 **1 CKB**，即 `100000000` shannons，RPC 十六进制金额为 `0x5f5e100`。
+lock args 和 address 使用 offckb 当前返回的值；`--config` 不改变默认选择的账户编号 `#5`。获取失败或账户缺失时，命令报错并在创建或恢复用户前停止。
 
-### 一次准备，复用同一条客户端通道
+账户保存在 `.state/fiber-lsp-client/default/`。请一起保留其中的 `root-key`、`signer.bin`、`account.json` 和开通后产生的 `channel.json`。注册、凭证和账户恢复的实现见 [客户端账户](docs/client-account.md)。
+
+### 7. 开通、查询和协作关闭
 
 ```bash
-./lsp-cli create-user     # 已实现；已有账户会直接恢复
-./lsp-cli open-channel    # 待实现；出资、签名并等待 ChannelReady
+./lsp-cli openchannel --funding-amount 1000
+./lsp-cli listChannel
+./lsp-cli closechannel
+./lsp-cli listChannel
 ```
 
-`open-channel` 应自动使用已保存的 LSP 公钥、项目中的 CKB RPC 和合约配置，以及约定的 devnet 出资账户。开通道时完成链上出资，后续付款和收款复用这条通道。
+金额单位为 CKB，最多八位小数；首次开通必须显式提供金额。`1000` 是本方总注入额，含 99 CKB 保留金额，因此初始可用余额为 901 CKB。Node3 和客户端共用 offckb #5；默认对方另注入 99 CKB，钱包总出资为 1099 CKB 加交易费。费用上限为每笔 1 CKB，出资、commitment 和关闭费率为 1000 shannons/1000 bytes；所有条款先保存在本地，返回提案必须与之相符。
 
-### 付款：拿到对端发票，执行一个命令
-
-对端普通节点通过 `new_invoice` 创建 devnet 发票（`currency: "Fibd"`），将 `invoice_address` 交给客户端：
+共用 #5 出资需至少两个普通 CKB live cells，余额须覆盖双方注入额和费用上限。新 devnet 的单个 genesis cell 需要先拆分；客户端会明确提示并保留原数据。开发资金准备可显式执行下列 Rust 检查：有多个 cells 时只检查，有一个大额 cell 时拆成两个同 #5 地址 cells，支付 1000 shannons 费用，等待链上确认：
 
 ```bash
-./lsp-cli pay '<对端的 invoice_address>'   # 待实现
+cargo test --manifest-path fiber-lsp-client/Cargo.toml prepare_shared_devnet_wallet_cells -- --ignored --nocapture
 ```
 
-`pay` 应在内部完成发票检查、本地付款授权、调用 `send_payment`、处理 SDK 签名请求和查询 `get_payment`。命令等待结果后退出，以 `status: "Success"` 确认付款完成。
+`open-channel` / `close-channel` 是别名。三个通道命令均支持 `--config PATH`；开关通道支持 `--timeout SECONDS`，默认 120 秒。`closechannel --channel-id 0x...` 可指定当前账户的已绑定通道，只做协作关闭；有未结算 TLC、余额不一致或状态过期时拒绝关闭。
 
-### 收款：创建发票，保持客户端在线
+开通成功要求出资链上确认且达到 `ChannelReady`；关闭成功要求关闭交易确认并核对 #5 退款。`listChannel` 展示开通中、可用、关闭中、已关闭及失败状态、双方余额、交易 hash 与本地恢复阶段，不提交交易或签名。
+
+超时、网络失败或退出后，保留账户目录全部文件，使用原配置重新执行同一命令：
 
 ```bash
-./lsp-cli create-invoice   # 待实现；建议默认创建 1 CKB 发票并输出 invoice_address
-./lsp-cli watch            # 待实现；持续处理签名和收款结算
+./lsp-cli openchannel    # 恢复原开通；不需要再次提供金额
+./lsp-cli closechannel   # 恢复原协作关闭
 ```
 
-将输出的 `invoice_address` 交给对端普通节点，由对端调用 `send_payment`。客户端在 `watch` 中处理入账签名和结算，查询 `get_invoice`，以 `status: "Paid"` 确认收款完成。`Received` 表示已收到但尚未结算。
+不同金额会被拒绝；重复开通返回原可用通道，重复关闭核对并返回原关闭结果。当前服务端 / SDK 限制同一租户关闭后再次开通，客户端保留旧 binding 和历史并明确提示，不自动清理或重新注册。
 
-### 客户端还需要补齐的操作
+## 原理与实现
 
-| 命令 | 必须完成的工作 |
-| --- | --- |
-| `open-channel` | 通过 SDK 的 `HostedSession::open_tenant_channel` 调用 `open_tenant_channel` RPC；核对并保存开通道结果，使用 CKB 钱包签名出资交易，调用 `submit_signed_funding_tx`，处理通道签名直到 `ChannelReady` |
-| `pay` | 保存 SDK 付款授权与付款进度，调用 `send_payment`，持续核验并提交通道签名，查询最终付款状态 |
-| `create-invoice` | 本地生成并保存 preimage 和 SDK 收款授权，通过 `new_invoice` 创建只提供 `payment_hash` 的 hold invoice，保存并输出发票 |
-| `watch` | 查询 `get_channel_signing_status`，经 SDK 核验后调用 `submit_channel_signature`；入账满足 SDK 的 preimage 释放检查后调用 `settle_invoice`，持续查询最终收款状态 |
-
-这些操作使用注册返回的 **用户凭证** 访问 LSP RPC，用户身份由凭证确定。签名和收款秘密保留在客户端，操作进度及时落盘；命令中断后先核对原操作，避免重复出资或付款。
-
-客户端实现范围见 [PLAN.md](PLAN.md)，SDK 接口以同级 Fiber 源码中的 [fiber-lsp-sdk README](../fiber/crates/fiber-lsp-sdk/README.md) 为准。
-
-## 运行数据
-
-`configs/lsp.yml` 和 `configs/keys/` 保存本地配置与凭证，已加入 Git 忽略规则；按上述步骤生成或同步。
-
-停止和重启保留链、节点和客户端账户数据，不自动清理。客户端账户中的 `root-key`、`signer.bin` 和 `account.json` 需要一起保留，以恢复同一个身份及其签名状态。
+- [devnet 与节点管理](docs/devnet.md)：本地编译、节点分工、启动脚本、端口和运行数据。
+- [Biscuit 凭证](docs/biscuit-auth.md)：公私钥、管理凭证、RPC 鉴权和用户凭证。
+- [客户端账户](docs/client-account.md)：SDK 身份、注册过程、存储和恢复。
+- [通道与收付款流程](docs/payment-flow.md)：已实现的通道生命周期，以及待实现的付款、收款。
+- [故障排查](docs/troubleshooting.md)：启动、RPC、账户问题与出资账户核对。

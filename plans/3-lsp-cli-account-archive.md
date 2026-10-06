@@ -41,7 +41,7 @@ GitHub [设计 issue #1625](https://github.com/nervosnetwork/fiber/issues/1625) 
 
 ## 约束与依赖
 
-- 依赖现有账户锁、注册 / 恢复、SDK signer store 和方案 2 已实现的通道生命周期代码；方案 2 仍待验收，未将本方案视为其必要前置或改动其验收范围。
+- 依赖现有账户锁、注册 / 恢复、SDK signer store 和方案 2 已实现的通道生命周期代码；方案 2 已由开发者验收并清理，原规划及在线验证记录见 Git 提交 `cde9aa2`；本方案为后续独立范围，不是方案 2 的必要前置。
 - 不修改 Fiber 服务端和 SDK。没有服务端注销 API；`lsp_evict_tenant` 只停止运行实例，不能作为注销。
 - 密钥、token、SDK 安全状态和通道意图保持完整，权限不放宽，不自动清理已有运行数据。
 - 全部管理和迁移逻辑写在 Rust；offckb 与 LSP 启动方式保持原约定。实施时同步 README 和账户使用文档。

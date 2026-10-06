@@ -81,6 +81,53 @@ pub async fn run(config: &Config, create: bool) -> Result<AccountStatus> {
     })
 }
 
+/// Holds the existing account lock for the complete lifecycle command.
+pub struct ClientAccount {
+    pub dir: AccountDir,
+    pub session: HostedSession<FileSignerStore>,
+    pub lsp_public_key: Pubkey,
+}
+
+impl ClientAccount {
+    pub async fn load(config: &Config) -> Result<Self> {
+        let path = config.account_dir();
+        if !path.try_exists()? {
+            bail!("账户不存在；请先执行 ./lsp-cli create-user");
+        }
+        let dir = AccountDir::lock(&path)?;
+        let (record, session) = restore(&dir, config).await?;
+        if record.registration != Registration::Registered {
+            bail!("账户注册尚未完成；请先执行 ./lsp-cli create-user；原数据已保留");
+        }
+        Ok(Self {
+            dir,
+            session,
+            lsp_public_key: record.lsp_public_key.unwrap(),
+        })
+    }
+
+    pub fn save(&self) -> Result<()> {
+        save_session(&self.dir, self.session.state())
+    }
+}
+
+fn save_session(dir: &AccountDir, state: &HostedSessionState) -> Result<()> {
+    let mut record: AccountRecord = dir.read_json()?;
+    record.session = state.clone();
+    dir.save_json(&record)
+}
+
+#[async_trait::async_trait]
+impl fiber_lsp_sdk::OpeningPersistence for AccountDir {
+    async fn save_session(
+        &self,
+        state: &HostedSessionState,
+    ) -> std::result::Result<(), fiber_lsp_sdk::SessionError> {
+        save_session(self, state)
+            .map_err(|e| fiber_lsp_sdk::SessionError::Invalid(format!("保存 session 失败：{e:#}")))
+    }
+}
+
 async fn initialize(
     dir: &AccountDir,
     config: &Config,
@@ -119,7 +166,7 @@ async fn restore(
     if record.rpc_url != config.rpc_url || record.rpc_auth_public_key != config.rpc_auth_public_key
     {
         bail!(
-            "configs/lsp.yml 的 RPC 地址或 Biscuit 公钥与保存的 LSP 关联不一致；原账户已保留，不能用于另一套服务"
+            "当前配置的 RPC 地址或 Biscuit 公钥与保存的 LSP 关联不一致；原账户已保留，不能用于另一套服务"
         );
     }
     let bytes = Zeroizing::new(read_private(&dir.path.join("root-key"))?);
@@ -231,7 +278,41 @@ async fn register(
 }
 
 #[cfg(test)]
-mod tests {
+pub async fn test_registered(config: &Config) -> ClientAccount {
+    let dir = AccountDir::lock(&config.account_dir()).unwrap();
+    let (mut record, mut session) = initialize(&dir, config).await.unwrap();
+    let lsp_public_key = Pubkey(RootKey::import([2; 32]).unwrap().public_key().serialize());
+    let tenant = serde_json::from_value(serde_json::json!({
+        "tenant_id": record.tenant_id, "root_signer_pubkey": record.identity_public_key,
+        "invoice_pubkey": record.identity_public_key, "private_channel_id": null,
+        "created_at": "0x1", "runtime_status": "cold", "channel_online": false,
+    }))
+    .unwrap();
+    session
+        .finish_registration(fiber_json_types::RegisterLspTenantResult {
+            tenant,
+            access_token: "user-test-token".into(),
+        })
+        .unwrap();
+    record.lsp_public_key = Some(lsp_public_key);
+    record.tenant = serde_json::from_value(serde_json::json!({
+        "tenant_id": record.tenant_id, "root_signer_pubkey": record.identity_public_key,
+        "invoice_pubkey": record.identity_public_key, "private_channel_id": null,
+        "created_at": "0x1", "runtime_status": "cold", "channel_online": false,
+    }))
+    .unwrap();
+    record.registration = Registration::Registered;
+    record.session = session.state().clone();
+    dir.save_json(&record).unwrap();
+    ClientAccount {
+        dir,
+        session,
+        lsp_public_key,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
     use std::{
         fs,
         io::{Read, Write},
@@ -244,7 +325,7 @@ mod tests {
 
     use super::*;
 
-    fn fixture() -> (tempfile::TempDir, Config, TcpListener) {
+    pub(crate) fn fixture() -> (tempfile::TempDir, Config, TcpListener) {
         let root = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let config = Config {
@@ -278,7 +359,10 @@ mod tests {
     }
 
     // A bounded HTTP fixture checks both the RPC method sequence and credential choice.
-    fn serve(listener: TcpListener, steps: Vec<(&'static str, Value)>) -> thread::JoinHandle<()> {
+    pub(crate) fn serve(
+        listener: TcpListener,
+        steps: Vec<(&'static str, Value)>,
+    ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             listener.set_nonblocking(true).unwrap();
             for (method, result) in steps {
@@ -320,12 +404,25 @@ mod tests {
                     }
                 };
                 assert_eq!(request["method"], method);
-                let expected_token = if method == "list_channels" {
-                    "user-test-token"
+                if matches!(
+                    method,
+                    "get_block_hash" | "get_transaction" | "get_live_cell"
+                ) {
+                    assert!(!headers.contains("authorization:"));
                 } else {
-                    "operator-test-token"
+                    let expected_token = if method.starts_with("lsp_") {
+                        "operator-test-token"
+                    } else {
+                        "user-test-token"
+                    };
+                    assert!(headers.contains(&format!("authorization: bearer {expected_token}")));
+                }
+                let result = if let Some(expected) = result.get("_expect_params") {
+                    assert_eq!(&request["params"], expected);
+                    result["_reply"].clone()
+                } else {
+                    result
                 };
-                assert!(headers.contains(&format!("authorization: bearer {expected_token}")));
                 let body = if let Some(error) = result.get("error") {
                     json!({"jsonrpc": "2.0", "id": request["id"], "error": error})
                 } else {
