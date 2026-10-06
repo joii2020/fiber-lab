@@ -1,5 +1,6 @@
-## 代码规范
-- 当需要新增/修改 Shell 脚本时，参阅：[Shell 脚本规范](AGENTS-Shell.md)
+## 基本规范
+- [Shell 脚本规范](AGENTS-Shell.md)
+- 方案规划遵循 [方案规划规范](AGENTS-Plan.md)。
 
 
 ## 开发约定
