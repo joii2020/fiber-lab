@@ -2,7 +2,7 @@
 
 审核：已确认；本次用户明确要求增加 archive-account、list-accounts，并允许通过列表中的账户关闭已归档但尚未关闭的通道；按既有草案落实本地清单与统一 --account 选择。
 授权：已授权；依据本次用户的功能实现请求，实施账户归档、列表、历史账户选择与关闭支持，更新使用文档及运行本地验证。
-进度：待验收
+进度：已完成
 
 ## 规划方式
 
@@ -87,8 +87,9 @@ GitHub [设计 issue #1625](https://github.com/nervosnetwork/fiber/issues/1625) 
 ## 执行记录与恢复点
 
 已完成：新增 Rust 账户清单与统一选择层；实现 archive-account、list-accounts、所有客户端命令的 --account ID，以及 close-channel 指定账户关闭；旧 default 目录原地保留，归档后新账户使用独立目录；恢复提示带账户 ID，已关闭账户不再输出无效开通恢复命令；同步 README 与账户文档；按本次用户要求将通道子命令统一为 open-channel、close-channel、list-channel，移除旧别名，并同步恢复提示、测试与使用文档。
-剩余工作：真实 devnet 多账户协作关闭、退款验证与开发者验收。
+剩余工作：无；开发者已确认本方案验收完成。
 验证结果：46 项测试通过，1 项既有测试忽略；cargo fmt --check、Clippy --all-targets -D warnings、release 构建及 git diff --check 均通过；release list-accounts 只读识别现有 default 账户，close-channel --help 显示 --account ID；账户选择、旧目录兼容、重复归档、锁冲突、未知 ID、损坏清单及目录缺失均有回归验证；归档 CloseRequested 账户后恢复原关闭请求的模拟 RPC 验证通过，新默认账户文件保持不变。本次命名统一后再次通过 46 项测试（1 项忽略）、格式检查、Clippy 和 release 构建；帮助输出使用统一命令名，旧名称拒绝解析。
-未验证项：真实 devnet 活跃通道归档后完整关闭及链上退款、两账户在线注册；未修改或归档现有运行账户。
-验收确认：待确认。
-恢复点：使用 release lsp-cli 在 devnet 按 README 的账户归档流程联调并验收；按用户要求提交本次实现与验证记录；保留本方案，待开发者验收后清理。
+未验证项：此前 AI 执行记录未验证真实 devnet 活跃通道归档后完整关闭及链上退款、两账户在线注册；本次未重跑上述在线验证，不将本地清单状态作为在线验证通过的依据。
+验收确认：2026-10-06，开发者通过“plans/3-lsp-cli-account-archive.md 完成验收”明确确认本方案验收完成。本次只读 list-accounts 显示 default 已归档且本地阶段为 closed，独立的新默认账户处于 registered，双方 tenant_id 不同；该查询不代表远端或链上验证。
+恢复点：无；先将验收记录保存到 Git，再清理本方案并同步 PLAN.md 引用，清理另行提交；保留已有账户及运行数据。
+相关提交：`249f6a7` 实现账户归档与历史账户关闭；`e62c398` 统一通道子命令命名。
