@@ -1,4 +1,6 @@
 .state/
-.tools/
-__pycache__/
-*.pyc
+node_modules/
+fiber-lsp-client/target/
+fiber-lsp-client/fiber-lsp-client
+configs/lsp.yml
+configs/keys/
