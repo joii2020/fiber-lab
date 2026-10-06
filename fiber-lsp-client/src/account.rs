@@ -37,15 +37,12 @@ pub struct AccountStatus {
     pub channel_count: usize,
 }
 
-pub async fn run(config: &Config, create: bool) -> Result<AccountStatus> {
-    let path = config.account_dir();
-    if !create && !path.try_exists()? {
-        bail!("账户不存在；请先执行 ./lsp-cli create-user");
-    }
-    let dir = AccountDir::lock(&path)?;
+pub async fn run(config: &Config, create: bool, selected: Option<&str>) -> Result<AccountStatus> {
+    let dir = crate::accounts::select(&config.root, selected, create)?;
+    let id = dir.path.file_name().unwrap().to_string_lossy();
     let (mut record, mut session) = if dir.is_initialized()? {
         restore(&dir, config).await?
-    } else if create {
+    } else if create && selected.is_none() {
         initialize(&dir, config).await?
     } else {
         bail!("账户不存在；请先执行 ./lsp-cli create-user");
@@ -60,7 +57,7 @@ pub async fn run(config: &Config, create: bool) -> Result<AccountStatus> {
     } else {
         if !create {
             bail!(
-                "账户身份已保存，但注册尚未完成；请执行 ./lsp-cli create-user 核对注册进度。原数据已保留"
+                "账户身份已保存，但注册尚未完成；请执行 ./lsp-cli create-user --account {id} 核对注册进度。原数据已保留"
             );
         }
         register(&dir, config, &rpc, &mut record, &mut session).await?;
@@ -69,10 +66,9 @@ pub async fn run(config: &Config, create: bool) -> Result<AccountStatus> {
     let token = session
         .tenant_token()
         .context("账户缺少用户凭证；原数据已保留")?;
-    let channels = rpc
-        .list_channels(token)
-        .await
-        .context("查询通道失败；已保存的账户保持不变，可再次执行 ./lsp-cli status")?;
+    let channels = rpc.list_channels(token).await.with_context(|| {
+        format!("查询通道失败；已保存的账户保持不变，可再次执行 ./lsp-cli status --account {id}")
+    })?;
     Ok(AccountStatus {
         outcome,
         identity: record.identity_public_key,
@@ -89,15 +85,12 @@ pub struct ClientAccount {
 }
 
 impl ClientAccount {
-    pub async fn load(config: &Config) -> Result<Self> {
-        let path = config.account_dir();
-        if !path.try_exists()? {
-            bail!("账户不存在；请先执行 ./lsp-cli create-user");
-        }
-        let dir = AccountDir::lock(&path)?;
+    pub async fn load(config: &Config, selected: Option<&str>) -> Result<Self> {
+        let dir = crate::accounts::select(&config.root, selected, false)?;
+        let id = dir.path.file_name().unwrap().to_string_lossy();
         let (record, session) = restore(&dir, config).await?;
         if record.registration != Registration::Registered {
-            bail!("账户注册尚未完成；请先执行 ./lsp-cli create-user；原数据已保留");
+            bail!("账户注册尚未完成；请先执行 ./lsp-cli create-user --account {id}；原数据已保留");
         }
         Ok(Self {
             dir,
@@ -463,13 +456,13 @@ pub(crate) mod tests {
             ],
         );
         drop(dir);
-        let created = run(&config, true).await.unwrap();
+        let created = run(&config, true, None).await.unwrap();
         assert_eq!(created.identity, identity);
         assert_eq!(created.tenant_id, id);
         assert_eq!(created.channel_count, 0);
         fs::remove_file(config.root.join("configs/keys/operator-token")).unwrap();
-        let status = run(&config, false).await.unwrap();
-        let repeated = run(&config, true).await.unwrap();
+        let status = run(&config, false, None).await.unwrap();
+        let repeated = run(&config, true, None).await.unwrap();
         assert_eq!(status.identity, identity);
         assert_eq!(status.tenant_id, id);
         assert_eq!(repeated.tenant_id, id);
@@ -493,7 +486,7 @@ pub(crate) mod tests {
             ],
         );
         drop(dir);
-        let error = run(&config, true).await.err().unwrap().to_string();
+        let error = run(&config, true, None).await.err().unwrap().to_string();
         assert!(error.contains("不提供凭证找回"));
         assert_eq!(
             fs::read(config.account_dir().join("account.json")).unwrap(),
@@ -524,7 +517,7 @@ pub(crate) mod tests {
             ],
         );
         drop(dir);
-        let error = run(&config, true).await.err().unwrap();
+        let error = run(&config, true, None).await.err().unwrap();
         assert!(error.to_string().contains("结果待核对"));
         assert!(!format!("{error:#}").contains("secret-response-token"));
         let dir = AccountDir::lock(&config.account_dir()).unwrap();
@@ -557,24 +550,25 @@ pub(crate) mod tests {
         let (_root, config, _listener) = fixture();
         fs::remove_file(config.root.join("configs/keys/operator-token")).unwrap();
         assert!(
-            run(&config, true)
+            run(&config, true, None)
                 .await
                 .err()
                 .unwrap()
                 .to_string()
                 .contains("operator-token")
         );
-        let dir = AccountDir::lock(&config.account_dir()).unwrap();
+        let dir = crate::accounts::select(&config.root, None, false).unwrap();
+        let account_path = dir.path.clone();
         let record: AccountRecord = dir.read_json().unwrap();
         assert!(record.registration == Registration::IdentitySaved);
         let root_before = fs::read(dir.path.join("root-key")).unwrap();
         drop(dir);
-        assert!(run(&config, true).await.is_err());
+        assert!(run(&config, true, None).await.is_err());
         assert_eq!(
-            fs::read(config.account_dir().join("root-key")).unwrap(),
+            fs::read(account_path.join("root-key")).unwrap(),
             root_before
         );
-        let error = run(&config, false).await.err().unwrap().to_string();
+        let error = run(&config, false, None).await.err().unwrap().to_string();
         assert!(error.contains("注册尚未完成"));
     }
 
@@ -606,11 +600,11 @@ pub(crate) mod tests {
                 json!({"error": {"code": -32999, "message": "user-test-token is invalid"}}),
             )],
         );
-        let error = run(&config, false).await.err().unwrap();
+        let error = run(&config, false, None).await.err().unwrap();
         assert!(format!("{error:#}").contains("JSON-RPC 错误"));
         assert!(!format!("{error:#}").contains("user-test-token"));
         server.join().unwrap();
-        let error = run(&config, false).await.err().unwrap();
+        let error = run(&config, false, None).await.err().unwrap();
         assert!(format!("{error:#}").contains("网络错误"));
         for (name, bytes) in crate::store::ACCOUNT_FILES.iter().zip(before) {
             assert_eq!(fs::read(config.account_dir().join(name)).unwrap(), bytes);

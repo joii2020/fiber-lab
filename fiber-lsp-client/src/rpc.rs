@@ -101,6 +101,7 @@ impl Config {
         Ok(Zeroizing::new(text.trim().to_owned()))
     }
 
+    #[cfg(test)]
     pub fn account_dir(&self) -> PathBuf {
         self.root.join(".state/fiber-lsp-client/default")
     }

@@ -1,4 +1,5 @@
 mod account;
+mod accounts;
 mod admin;
 mod channel;
 mod rpc;
@@ -31,15 +32,28 @@ enum Command {
     #[command(name = "openchannel", visible_alias = "open-channel")]
     OpenChannel(channel::OpenOptions),
     /// 协作关闭当前账户通道并核对链上退款
-    #[command(name = "closechannel", visible_alias = "close-channel")]
+    #[command(name = "closechannel", visible_aliases = ["close-channel", "closeChannel"])]
     CloseChannel(channel::CloseOptions),
     /// 只读查询当前账户的所有通道及本地恢复阶段
     #[command(name = "listChannel")]
     ListChannel(ClientOptions),
+    /// 将当前账户归档，保留身份与通道记录
+    ArchiveAccount(AccountOptions),
+    /// 只读列出当前及已归档的本地账户
+    ListAccounts,
+}
+
+#[derive(Args)]
+struct AccountOptions {
+    #[arg(long, value_name = "ID")]
+    account: Option<String>,
 }
 
 #[derive(Args)]
 struct ClientOptions {
+    /// list-accounts 列出的账户 ID；省略时使用默认账户
+    #[arg(long, value_name = "ID")]
+    account: Option<String>,
     /// 配置路径；默认 ${XDG_DATA_HOME:-$HOME/.local/share}/offckb-nodejs/devnet/fiber/nodes/3/config.yml
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -76,16 +90,24 @@ async fn run() -> Result<()> {
             println!("权限：{}", admin::PERMISSIONS);
             println!("签发完成；重启时复用该凭证。");
         }
+        Command::ListAccounts => accounts::list(&accounts::root())?,
+        Command::ArchiveAccount(options) => {
+            let id = accounts::archive(&accounts::root(), options.account.as_deref())?;
+            println!("账户 {id} 已归档；身份、凭证及通道记录保留，未关闭通道或注销租户。");
+            println!("查询：./lsp-cli listChannel --account {id}");
+            println!("关闭 / 恢复：./lsp-cli closeChannel --account {id}");
+            println!("创建默认账户：./lsp-cli create-user");
+        }
         Command::OpenChannel(options) => channel::open(options).await?,
         Command::CloseChannel(options) => channel::close(options).await?,
         Command::ListChannel(options) => {
             let config = rpc::Config::load(options.config.as_deref())?;
-            channel::list(&config).await?;
+            channel::list(&config, options.account.as_deref()).await?;
         }
         Command::CreateUser(options) | Command::Status(options) => {
             let config = rpc::Config::load(options.config.as_deref())?;
             let funding = default_funding_account()?;
-            let account = account::run(&config, create).await?;
+            let account = account::run(&config, create, options.account.as_deref()).await?;
             println!("{}", account.outcome);
             println!("身份公钥：{}", account.identity);
             println!("tenant_id：{}", account.tenant_id);
@@ -153,6 +175,32 @@ mod tests {
                 .is_err()
         );
         assert!(parse_funding_account(b"invalid json").is_err());
+    }
+
+    #[test]
+    fn account_management_and_archived_close_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["lsp-cli", "list-accounts"])
+                .unwrap()
+                .command,
+            Some(Command::ListAccounts)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["lsp-cli", "archive-account"])
+                .unwrap()
+                .command,
+            Some(Command::ArchiveAccount(_))
+        ));
+        for name in ["closeChannel", "closechannel", "close-channel"] {
+            let Some(Command::CloseChannel(options)) =
+                Cli::try_parse_from(["lsp-cli", name, "--account", "default"])
+                    .unwrap()
+                    .command
+            else {
+                panic!("close command expected")
+            };
+            assert_eq!(options.account.as_deref(), Some("default"));
+        }
     }
 
     #[test]

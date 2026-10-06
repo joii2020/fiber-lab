@@ -45,7 +45,7 @@
 
 ## 本地存储
 
-账户目录为 `.state/fiber-lsp-client/default/`：
+旧账户目录为 `.state/fiber-lsp-client/default/`，新账户使用 `.state/fiber-lsp-client/accounts/<ID>/`；清单 `.state/fiber-lsp-client/accounts.json` 记录默认账户和归档状态。每个账户目录包含：
 
 | 文件 | 内容 |
 | --- | --- |
@@ -79,3 +79,13 @@
 `closechannel` 从本地已验证的两条 commitment 核对余额和 TLC，独立计算关闭大小及客户端承担的费用，在请求前保存授权。恢复先查询状态：已在关闭中时处理原签名，已关闭时独立核对链上退款。原账户、binding、交易和失败记录均保留。
 
 阶段包括 `Opening`、`FundingSaved`、`FundingSubmitted`、`Ready`、`CloseRequested`、`Closing`、`Closed`。超时或失败打印当前阶段和恢复命令；`listChannel` 只读查询，不代替恢复命令推进操作。具体用法见 [通道生命周期](../README.md#7-开通查询和协作关闭)。
+
+## 账户归档与历史账户
+
+`./lsp-cli list-accounts` 只读展示本地账户 ID、当前 / 归档状态、tenant_id 及本地恢复阶段，不调用 RPC，不打印密钥或 token。旧 default 目录可以直接识别，无需移动文件；记录不完整时列表显示待恢复。
+
+`./lsp-cli archive-account` 归档当前账户并释放默认位置，保留所有原文件、SDK 安全状态和通道记录，不关闭通道或注销服务端租户。之后显式执行 `create-user` 才创建新身份。再次归档相同账户可使用 `archive-account --account ID`。
+
+`create-user`、`status`、`listChannel`、`openchannel`、`closechannel`（别名 `closeChannel`）均支持 `--account ID`。ID 直接取自 `list-accounts`，指定历史账户不会改变默认选择；`create-user --account ID` 只恢复已有身份。归档但尚未关闭的通道使用 `closeChannel --account ID` 关闭，关闭中的操作也通过同一命令恢复。当前服务端仍限制同一租户关闭后再次开通。
+
+清单与账户分别持锁，按清单锁 → 账户锁顺序取得，网络操作期间只持有账户锁；并发归档或操作同一账户时明确拒绝并提示重试，不移动或清理目录。未知 ID、损坏清单或缺失目录拒绝操作并保留数据。

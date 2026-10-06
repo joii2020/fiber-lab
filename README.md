@@ -24,7 +24,7 @@ Fiber 源码默认放在同级目录 `../fiber`，必须包含 LSP 实现和 `cr
 ./scripts/build-fiber.sh
 ```
 
-成功后，`./lsp-cli --help` 会列出 `admin`、`create-user`、`status`、`openchannel`、`closechannel` 和 `listChannel`。
+成功后，`./lsp-cli --help` 会列出 `admin`、`create-user`、`status`、`openchannel`、`closechannel` 、`listChannel`、`archive-account` 和 `list-accounts`。
 更换 Fiber 源码目录的方式见 [编译与本地依赖](docs/devnet.md#编译与本地依赖)。
 
 ### 2. 初始化节点
@@ -144,7 +144,19 @@ bash scripts/stop.sh
 
 lock args 和 address 使用 offckb 当前返回的值；`--config` 不改变默认选择的账户编号 `#5`。获取失败或账户缺失时，命令报错并在创建或恢复用户前停止。
 
-账户保存在 `.state/fiber-lsp-client/default/`。请一起保留其中的 `root-key`、`signer.bin`、`account.json` 和开通后产生的 `channel.json`。注册、凭证和账户恢复的实现见 [客户端账户](docs/client-account.md)。
+原有账户仍保存在 `.state/fiber-lsp-client/default/`；新账户保存在 `.state/fiber-lsp-client/accounts/<ID>/`，默认位置与归档状态由 `accounts.json` 记录。请一起保留其中的 `root-key`、`signer.bin`、`account.json` 和开通后产生的 `channel.json`。注册、凭证和账户恢复的实现见 [客户端账户](docs/client-account.md)。
+
+归档当前账户并创建下一轮联调账户：
+
+```bash
+./lsp-cli list-accounts
+./lsp-cli archive-account
+./lsp-cli create-user
+./lsp-cli listChannel --account <旧账户ID>
+./lsp-cli closeChannel --account <旧账户ID>
+```
+
+`<旧账户ID>` 直接使用 `list-accounts` 输出的账户 ID。`archive-account` 保留身份、密钥、凭证和通道历史，只释放默认账户位置；不关闭通道、不注销租户，也不自动创建账户。`list-accounts` 无需配置或 RPC，展示账户 ID、当前 / 归档状态、tenant_id 和本地阶段；本地阶段不代表远端或链上状态。所有客户端命令支持 `--account ID`，显式选择历史账户不会切换默认账户；未知 ID 会拒绝操作。重复归档可使用 `archive-account --account ID`。归档后尚未关闭的账户仍可协作关闭，关闭中的账户可继续恢复；原有通道归属和退款核验规则继续适用。
 
 ### 7. 开通、查询和协作关闭
 
@@ -163,7 +175,7 @@ lock args 和 address 使用 offckb 当前返回的值；`--config` 不改变默
 cargo test --manifest-path fiber-lsp-client/Cargo.toml prepare_shared_devnet_wallet_cells -- --ignored --nocapture
 ```
 
-`open-channel` / `close-channel` 是别名。三个通道命令均支持 `--config PATH`；开关通道支持 `--timeout SECONDS`，默认 120 秒。`closechannel --channel-id 0x...` 可指定当前账户的已绑定通道，只做协作关闭；有未结算 TLC、余额不一致或状态过期时拒绝关闭。
+`open-channel` / `close-channel` 是别名，`closeChannel` 也是 `closechannel` 的别名。三个通道命令均支持 `--config PATH`；开关通道支持 `--timeout SECONDS`，默认 120 秒。`closechannel --channel-id 0x...` 可指定当前账户的已绑定通道，只做协作关闭；有未结算 TLC、余额不一致或状态过期时拒绝关闭。
 
 开通成功要求出资链上确认且达到 `ChannelReady`；关闭成功要求关闭交易确认并核对 #5 退款。`listChannel` 展示开通中、可用、关闭中、已关闭及失败状态、双方余额、交易 hash 与本地恢复阶段，不提交交易或签名。
 

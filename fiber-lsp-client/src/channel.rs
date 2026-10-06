@@ -28,6 +28,9 @@ use std::{
 pub struct OpenOptions {
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
+    /// list-accounts 列出的账户 ID
+    #[arg(long, value_name = "ID")]
+    pub account: Option<String>,
     /// 本方总注入额（含保留金额），最多八位小数；首次开通必填
     #[arg(long, value_parser = parse_amount)]
     pub funding_amount: Option<u64>,
@@ -40,6 +43,9 @@ pub struct OpenOptions {
 pub struct CloseOptions {
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
+    /// list-accounts 列出的账户 ID
+    #[arg(long, value_name = "ID")]
+    pub account: Option<String>,
     #[arg(long)]
     pub channel_id: Option<Hash256>,
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
@@ -200,7 +206,7 @@ impl TenantOpeningRpc for OpeningRpc<'_> {
 
 pub async fn open(options: OpenOptions) -> Result<()> {
     let config = Config::load(options.config.as_deref())?;
-    let mut account = ClientAccount::load(&config).await?;
+    let mut account = ClientAccount::load(&config, options.account.as_deref()).await?;
     account.session = account.session.with_policy(SigningPolicy::Manual);
     let rpc = Rpc::new(&config.rpc_url)?;
     let result = tokio::time::timeout(
@@ -568,7 +574,7 @@ async fn sign_status(
 
 pub async fn close(options: CloseOptions) -> Result<()> {
     let config = Config::load(options.config.as_deref())?;
-    let mut account = ClientAccount::load(&config).await?;
+    let mut account = ClientAccount::load(&config, options.account.as_deref()).await?;
     account.session = account.session.with_policy(SigningPolicy::Manual);
     let rpc = Rpc::new(&config.rpc_url)?;
     let result = tokio::time::timeout(
@@ -872,14 +878,23 @@ fn finish_command(
     let stage = read_intent(dir)?
         .map(|i| format!("{:?}", i.stage))
         .unwrap_or_else(|| "尚未保存意图".into());
+    let account = dir.path.file_name().unwrap().to_string_lossy();
     let config = config
         .map(|p| format!(" --config {}", p.display()))
         .unwrap_or_default();
-    Err(error.context(format!("当前阶段：{stage}；原数据保留。恢复命令：./lsp-cli {command}{config}；查询：./lsp-cli listChannel{config}")))
+    if command == "openchannel"
+        && matches!(
+            read_intent(dir)?.map(|i| i.stage),
+            Some(Stage::Closed | Stage::Closing | Stage::CloseRequested)
+        )
+    {
+        return Err(error.context(format!("当前阶段：{stage}；旧记录保留。查询：./lsp-cli listChannel --account {account}{config}；账户管理：./lsp-cli list-accounts / archive-account --account {account}")));
+    }
+    Err(error.context(format!("当前阶段：{stage}；原数据保留。恢复命令：./lsp-cli {command} --account {account}{config}；查询：./lsp-cli listChannel --account {account}{config}")))
 }
 
-pub async fn list(config: &Config) -> Result<()> {
-    let account = ClientAccount::load(config).await?;
+pub async fn list(config: &Config, selected: Option<&str>) -> Result<()> {
+    let account = ClientAccount::load(config, selected).await?;
     let rpc = Rpc::new(&config.rpc_url)?;
     let channels = rpc.list_all_channels(token(&account)?).await?;
     let intent = read_intent(&account.dir)?;
@@ -950,12 +965,13 @@ pub async fn list(config: &Config) -> Result<()> {
         println!("本地阶段：{:?}", intent.stage);
         if !matches!(intent.stage, Stage::Ready | Stage::Closed) {
             println!(
-                "待恢复：./lsp-cli {}",
+                "待恢复：./lsp-cli {} --account {}",
                 if intent.close_authorization.is_some() {
                     "closechannel"
                 } else {
                     "openchannel"
-                }
+                },
+                account.dir.path.file_name().unwrap().to_string_lossy()
             );
         }
         if intent.stage == Stage::Closed {
@@ -1070,7 +1086,7 @@ mod tests {
                 ("list_channels", json!({"channels":[]})),
             ],
         );
-        list(&config).await.unwrap();
+        list(&config, None).await.unwrap();
         server.join().unwrap();
         for (name, bytes) in originals {
             assert_eq!(
@@ -1097,6 +1113,7 @@ mod tests {
             ],
         );
         let options = OpenOptions {
+            account: None,
             config: None,
             funding_amount: Some(1001 * CKB),
             timeout: 1,
@@ -1351,6 +1368,7 @@ mod tests {
         );
         let rpc = Rpc::new(&config.rpc_url).unwrap();
         let options = OpenOptions {
+            account: None,
             config: None,
             funding_amount: None,
             timeout: 1,
@@ -1359,7 +1377,7 @@ mod tests {
         let original_request = account.session.state().opening_request.clone();
         assert!(original_request.is_some());
         drop(account);
-        let mut restored = ClientAccount::load(&config).await.unwrap();
+        let mut restored = ClientAccount::load(&config, None).await.unwrap();
         assert!(open_inner(&options, &mut restored, &rpc).await.is_err());
         assert_eq!(restored.session.pending_channel_key_id(), pending);
         assert_eq!(restored.session.state().opening_request, original_request);
@@ -1479,6 +1497,17 @@ mod tests {
         });
         save_intent(&account.dir, &record).unwrap();
         let original = std::fs::read(account.dir.path.join("channel.json")).unwrap();
+        drop(account);
+        let archived_id = crate::accounts::archive(&config.root, None).unwrap();
+        let new_default = crate::accounts::select(&config.root, None, true).unwrap();
+        atomic_write(&new_default.path.join("root-key"), b"new-account-marker").unwrap();
+        let account = ClientAccount::load(&config, Some(&archived_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_intent(&account.dir).unwrap().unwrap().stage,
+            Stage::CloseRequested
+        );
         let ready = channel_projection(&record);
         let mut shutting = ready.clone();
         shutting.state = serde_json::from_value(
@@ -1520,6 +1549,11 @@ mod tests {
             std::fs::read(account.dir.path.join("channel.json")).unwrap(),
             original
         );
+        assert_eq!(
+            std::fs::read(new_default.path.join("root-key")).unwrap(),
+            b"new-account-marker"
+        );
+        assert!(!new_default.path.join("channel.json").exists());
         server.join().unwrap();
     }
 
@@ -1540,6 +1574,7 @@ mod tests {
             ],
         );
         let options = CloseOptions {
+            account: None,
             config: None,
             channel_id: Some(Hash256([9; 32])),
             timeout: 1,
