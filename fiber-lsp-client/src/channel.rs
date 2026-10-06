@@ -214,7 +214,12 @@ pub async fn open(options: OpenOptions) -> Result<()> {
         open_inner(&options, &mut account, &rpc),
     )
     .await;
-    finish_command(result, &account.dir, "openchannel", options.config.as_ref())
+    finish_command(
+        result,
+        &account.dir,
+        "open-channel",
+        options.config.as_ref(),
+    )
 }
 
 async fn open_inner(options: &OpenOptions, account: &mut ClientAccount, rpc: &Rpc) -> Result<()> {
@@ -239,7 +244,7 @@ async fn open_inner(options: &OpenOptions, account: &mut ClientAccount, rpc: &Rp
                 intent.stage,
                 Stage::Closed | Stage::CloseRequested | Stage::Closing
             ),
-            "当前服务端 / SDK 限制同一租户关闭后再次开通；旧记录已保留，请用 ./lsp-cli listChannel 查询"
+            "当前服务端 / SDK 限制同一租户关闭后再次开通；旧记录已保留，请用 ./lsp-cli list-channel 查询"
         );
         intent
     } else {
@@ -585,7 +590,7 @@ pub async fn close(options: CloseOptions) -> Result<()> {
     finish_command(
         result,
         &account.dir,
-        "closechannel",
+        "close-channel",
         options.config.as_ref(),
     )
 }
@@ -596,7 +601,7 @@ async fn close_inner(options: &CloseOptions, account: &mut ClientAccount, rpc: &
         let intent = read_intent(&account.dir)?;
         ensure!(
             intent.is_none(),
-            "本地有开通意图但远端尚无通道；先恢复 ./lsp-cli openchannel"
+            "本地有开通意图但远端尚无通道；先恢复 ./lsp-cli open-channel"
         );
         println!("当前账户没有活动通道");
         return Ok(());
@@ -607,7 +612,7 @@ async fn close_inner(options: &CloseOptions, account: &mut ClientAccount, rpc: &
     let id = intent
         .opening
         .as_ref()
-        .context("开通未完成；先恢复 ./lsp-cli openchannel")?
+        .context("开通未完成；先恢复 ./lsp-cli open-channel")?
         .channel_id;
     ensure!(
         options.channel_id.is_none_or(|value| value == id),
@@ -633,7 +638,7 @@ async fn close_inner(options: &CloseOptions, account: &mut ClientAccount, rpc: &
     if intent.close_authorization.is_none() {
         ensure!(
             channel.state == ChannelState::ChannelReady && intent.stage == Stage::Ready,
-            "开通未完成或状态过期；先恢复 ./lsp-cli openchannel"
+            "开通未完成或状态过期；先恢复 ./lsp-cli open-channel"
         );
         check_balances(channel, &intent)?;
         let hash = intent.funding_hash.as_ref().context("缺少出资 hash")?;
@@ -882,15 +887,15 @@ fn finish_command(
     let config = config
         .map(|p| format!(" --config {}", p.display()))
         .unwrap_or_default();
-    if command == "openchannel"
+    if command == "open-channel"
         && matches!(
             read_intent(dir)?.map(|i| i.stage),
             Some(Stage::Closed | Stage::Closing | Stage::CloseRequested)
         )
     {
-        return Err(error.context(format!("当前阶段：{stage}；旧记录保留。查询：./lsp-cli listChannel --account {account}{config}；账户管理：./lsp-cli list-accounts / archive-account --account {account}")));
+        return Err(error.context(format!("当前阶段：{stage}；旧记录保留。查询：./lsp-cli list-channel --account {account}{config}；账户管理：./lsp-cli list-accounts / archive-account --account {account}")));
     }
-    Err(error.context(format!("当前阶段：{stage}；原数据保留。恢复命令：./lsp-cli {command} --account {account}{config}；查询：./lsp-cli listChannel --account {account}{config}")))
+    Err(error.context(format!("当前阶段：{stage}；原数据保留。恢复命令：./lsp-cli {command} --account {account}{config}；查询：./lsp-cli list-channel --account {account}{config}")))
 }
 
 pub async fn list(config: &Config, selected: Option<&str>) -> Result<()> {
@@ -967,9 +972,9 @@ pub async fn list(config: &Config, selected: Option<&str>) -> Result<()> {
             println!(
                 "待恢复：./lsp-cli {} --account {}",
                 if intent.close_authorization.is_some() {
-                    "closechannel"
+                    "close-channel"
                 } else {
-                    "openchannel"
+                    "open-channel"
                 },
                 account.dir.path.file_name().unwrap().to_string_lossy()
             );

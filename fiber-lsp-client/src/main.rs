@@ -29,13 +29,10 @@ enum Command {
     /// 使用用户凭证查询当前账户的通道数量
     Status(ClientOptions),
     /// 开通或恢复 CKB 私有通道（金额单位 CKB）
-    #[command(name = "openchannel", visible_alias = "open-channel")]
     OpenChannel(channel::OpenOptions),
     /// 协作关闭当前账户通道并核对链上退款
-    #[command(name = "closechannel", visible_aliases = ["close-channel", "closeChannel"])]
     CloseChannel(channel::CloseOptions),
     /// 只读查询当前账户的所有通道及本地恢复阶段
-    #[command(name = "listChannel")]
     ListChannel(ClientOptions),
     /// 将当前账户归档，保留身份与通道记录
     ArchiveAccount(AccountOptions),
@@ -94,8 +91,8 @@ async fn run() -> Result<()> {
         Command::ArchiveAccount(options) => {
             let id = accounts::archive(&accounts::root(), options.account.as_deref())?;
             println!("账户 {id} 已归档；身份、凭证及通道记录保留，未关闭通道或注销租户。");
-            println!("查询：./lsp-cli listChannel --account {id}");
-            println!("关闭 / 恢复：./lsp-cli closeChannel --account {id}");
+            println!("查询：./lsp-cli list-channel --account {id}");
+            println!("关闭 / 恢复：./lsp-cli close-channel --account {id}");
             println!("创建默认账户：./lsp-cli create-user");
         }
         Command::OpenChannel(options) => channel::open(options).await?,
@@ -191,16 +188,14 @@ mod tests {
                 .command,
             Some(Command::ArchiveAccount(_))
         ));
-        for name in ["closeChannel", "closechannel", "close-channel"] {
-            let Some(Command::CloseChannel(options)) =
-                Cli::try_parse_from(["lsp-cli", name, "--account", "default"])
-                    .unwrap()
-                    .command
-            else {
-                panic!("close command expected")
-            };
-            assert_eq!(options.account.as_deref(), Some("default"));
-        }
+        let Some(Command::CloseChannel(options)) =
+            Cli::try_parse_from(["lsp-cli", "close-channel", "--account", "default"])
+                .unwrap()
+                .command
+        else {
+            panic!("close command expected")
+        };
+        assert_eq!(options.account.as_deref(), Some("default"));
     }
 
     #[test]

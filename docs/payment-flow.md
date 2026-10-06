@@ -1,6 +1,6 @@
 # 通道与收付款流程
 
-开通道、独立 `listChannel` 查询及协作关闭已实现。`pay`、`create-invoice` 和 `watch` 仍为后续设计，其示例命令尚不可执行。当前可执行流程见 [快速开始](../README.md)。
+开通道、独立 `list-channel` 查询及协作关闭已实现。`pay`、`create-invoice` 和 `watch` 仍为后续设计，其示例命令尚不可执行。当前可执行流程见 [快速开始](../README.md)。
 
 ## 联调路径与余额
 
@@ -20,20 +20,20 @@
 
 ```bash
 ./lsp-cli create-user
-./lsp-cli openchannel --funding-amount 1000
-./lsp-cli listChannel
+./lsp-cli open-channel --funding-amount 1000
+./lsp-cli list-channel
 ```
 
 开通使用已有账户及 LSP 公钥，依据本地 Node3 配置授权 #5 钱包的双方注入额。示例中本方 1000 CKB（含 99 CKB 保留金额）、对方默认 99 CKB，总钱包出资为 1099 CKB 加实际交易费。钱包核验所有 inputs、找零、合约和费用后签名，SDK 核验开通条款和初始 commitment；最终等待链上出资确认及 `ChannelReady`。
 
-`listChannel` 独立展示当前账户的通道、余额、出资 / 关闭 hash 和待恢复阶段；查询不提交任何签名。中断后 `./lsp-cli openchannel` 核对并恢复原意图，不改变身份或重复出资。
+`list-channel` 独立展示当前账户的通道、余额、出资 / 关闭 hash 和待恢复阶段；查询不提交任何签名。中断后 `./lsp-cli open-channel` 核对并恢复原意图，不改变身份或重复出资。
 
 ```bash
-./lsp-cli closechannel
-./lsp-cli listChannel
+./lsp-cli close-channel
+./lsp-cli list-channel
 ```
 
-协作关闭要求本地已验证余额一致且没有未结算 TLC，退款使用开通时绑定的 #5 默认 lock。关闭费在本地独立计算，由发起方承担；只有关闭交易链上确认且退款匹配才报告成功。中断后重复 `closechannel` 继续原操作。当前同租户关闭后再开通受服务端 / SDK 单通道记录限制，旧记录保留。命令、别名、金额及资金 cells 准备见 [README](../README.md#7-开通查询和协作关闭)。
+协作关闭要求本地已验证余额一致且没有未结算 TLC，退款使用开通时绑定的 #5 默认 lock。关闭费在本地独立计算，由发起方承担；只有关闭交易链上确认且退款匹配才报告成功。中断后重复 `close-channel` 继续原操作。当前同租户关闭后再开通受服务端 / SDK 单通道记录限制，旧记录保留。命令、金额及资金 cells 准备见 [README](../README.md#7-开通查询和协作关闭)。
 
 ## 付款：接收对端发票
 

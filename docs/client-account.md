@@ -9,9 +9,9 @@
 ```bash
 ./lsp-cli create-user
 ./lsp-cli status
-./lsp-cli listChannel
-./lsp-cli openchannel --funding-amount 1000
-./lsp-cli closechannel
+./lsp-cli list-channel
+./lsp-cli open-channel --funding-amount 1000
+./lsp-cli close-channel
 ```
 
 客户端默认直接从 `${XDG_DATA_HOME:-$HOME/.local/share}/offckb-nodejs/devnet/fiber/nodes/3/config.yml` 读取 `rpc.listening_addr` 和 `rpc.biscuit_public_key`，与管理命令使用同一个 Node3 配置。管理 token 位于项目的 `configs/keys/operator-token`。
@@ -74,11 +74,11 @@
 
 开通时从 Node3 的 CKB RPC、合约部署、链 spec 和 genesis 获取可信参数，保存 genesis hash、双方总注入额、默认 lock dep、费率及钱包费用上限。钱包在 Rust 进程中读取 #5 私钥并验证其公钥哈希，捕获 offckb 的 stdout / stderr；不打印、保存或传送私钥。通道 MuSig2 密钥仍来自 SDK，与出资钱包密钥独立。
 
-`openchannel` 恢复时先查租户所有通道及 pending / failed 记录，签名前解析全部链上 inputs，核对通道输出、找零、费用和合约。出资提交前查链：`unknown` 可在仍等待外部出资时重发已保存的相同交易；`pending`、`proposed`、`committed` 不重复出资，`rejected` 停止。签名响应丢失后按当前 request ID 与完整请求复用本地签名，SDK 历史防止冲突签名。
+`open-channel` 恢复时先查租户所有通道及 pending / failed 记录，签名前解析全部链上 inputs，核对通道输出、找零、费用和合约。出资提交前查链：`unknown` 可在仍等待外部出资时重发已保存的相同交易；`pending`、`proposed`、`committed` 不重复出资，`rejected` 停止。签名响应丢失后按当前 request ID 与完整请求复用本地签名，SDK 历史防止冲突签名。
 
-`closechannel` 从本地已验证的两条 commitment 核对余额和 TLC，独立计算关闭大小及客户端承担的费用，在请求前保存授权。恢复先查询状态：已在关闭中时处理原签名，已关闭时独立核对链上退款。原账户、binding、交易和失败记录均保留。
+`close-channel` 从本地已验证的两条 commitment 核对余额和 TLC，独立计算关闭大小及客户端承担的费用，在请求前保存授权。恢复先查询状态：已在关闭中时处理原签名，已关闭时独立核对链上退款。原账户、binding、交易和失败记录均保留。
 
-阶段包括 `Opening`、`FundingSaved`、`FundingSubmitted`、`Ready`、`CloseRequested`、`Closing`、`Closed`。超时或失败打印当前阶段和恢复命令；`listChannel` 只读查询，不代替恢复命令推进操作。具体用法见 [通道生命周期](../README.md#7-开通查询和协作关闭)。
+阶段包括 `Opening`、`FundingSaved`、`FundingSubmitted`、`Ready`、`CloseRequested`、`Closing`、`Closed`。超时或失败打印当前阶段和恢复命令；`list-channel` 只读查询，不代替恢复命令推进操作。具体用法见 [通道生命周期](../README.md#7-开通查询和协作关闭)。
 
 ## 账户归档与历史账户
 
@@ -86,6 +86,6 @@
 
 `./lsp-cli archive-account` 归档当前账户并释放默认位置，保留所有原文件、SDK 安全状态和通道记录，不关闭通道或注销服务端租户。之后显式执行 `create-user` 才创建新身份。再次归档相同账户可使用 `archive-account --account ID`。
 
-`create-user`、`status`、`listChannel`、`openchannel`、`closechannel`（别名 `closeChannel`）均支持 `--account ID`。ID 直接取自 `list-accounts`，指定历史账户不会改变默认选择；`create-user --account ID` 只恢复已有身份。归档但尚未关闭的通道使用 `closeChannel --account ID` 关闭，关闭中的操作也通过同一命令恢复。当前服务端仍限制同一租户关闭后再次开通。
+`create-user`、`status`、`list-channel`、`open-channel`、`close-channel`均支持 `--account ID`。ID 直接取自 `list-accounts`，指定历史账户不会改变默认选择；`create-user --account ID` 只恢复已有身份。归档但尚未关闭的通道使用 `close-channel --account ID` 关闭，关闭中的操作也通过同一命令恢复。当前服务端仍限制同一租户关闭后再次开通。
 
 清单与账户分别持锁，按清单锁 → 账户锁顺序取得，网络操作期间只持有账户锁；并发归档或操作同一账户时明确拒绝并提示重试，不移动或清理目录。未知 ID、损坏清单或缺失目录拒绝操作并保留数据。

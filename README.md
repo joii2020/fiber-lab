@@ -24,7 +24,7 @@ Fiber 源码默认放在同级目录 `../fiber`，必须包含 LSP 实现和 `cr
 ./scripts/build-fiber.sh
 ```
 
-成功后，`./lsp-cli --help` 会列出 `admin`、`create-user`、`status`、`openchannel`、`closechannel` 、`listChannel`、`archive-account` 和 `list-accounts`。
+成功后，`./lsp-cli --help` 会列出 `admin`、`create-user`、`status`、`open-channel`、`close-channel`、`list-channel`、`archive-account` 和 `list-accounts`。
 更换 Fiber 源码目录的方式见 [编译与本地依赖](docs/devnet.md#编译与本地依赖)。
 
 ### 2. 初始化节点
@@ -115,7 +115,7 @@ bash scripts/stop.sh
 ./lsp-cli create-user
 
 # 独立查询当前账户的通道（只读）
-./lsp-cli listChannel
+./lsp-cli list-channel
 ```
 
 `create-user` 和 `status` 默认直接从 offckb Node3 的 `config.yml` 读取 RPC 地址和 Biscuit 公钥，无需复制配置。默认路径为 `${XDG_DATA_HOME:-$HOME/.local/share}/offckb-nodejs/devnet/fiber/nodes/3/config.yml`，与管理 token 签发命令一致。
@@ -152,8 +152,8 @@ lock args 和 address 使用 offckb 当前返回的值；`--config` 不改变默
 ./lsp-cli list-accounts
 ./lsp-cli archive-account
 ./lsp-cli create-user
-./lsp-cli listChannel --account <旧账户ID>
-./lsp-cli closeChannel --account <旧账户ID>
+./lsp-cli list-channel --account <旧账户ID>
+./lsp-cli close-channel --account <旧账户ID>
 ```
 
 `<旧账户ID>` 直接使用 `list-accounts` 输出的账户 ID。`archive-account` 保留身份、密钥、凭证和通道历史，只释放默认账户位置；不关闭通道、不注销租户，也不自动创建账户。`list-accounts` 无需配置或 RPC，展示账户 ID、当前 / 归档状态、tenant_id 和本地阶段；本地阶段不代表远端或链上状态。所有客户端命令支持 `--account ID`，显式选择历史账户不会切换默认账户；未知 ID 会拒绝操作。重复归档可使用 `archive-account --account ID`。归档后尚未关闭的账户仍可协作关闭，关闭中的账户可继续恢复；原有通道归属和退款核验规则继续适用。
@@ -161,10 +161,10 @@ lock args 和 address 使用 offckb 当前返回的值；`--config` 不改变默
 ### 7. 开通、查询和协作关闭
 
 ```bash
-./lsp-cli openchannel --funding-amount 1000
-./lsp-cli listChannel
-./lsp-cli closechannel
-./lsp-cli listChannel
+./lsp-cli open-channel --funding-amount 1000
+./lsp-cli list-channel
+./lsp-cli close-channel
+./lsp-cli list-channel
 ```
 
 金额单位为 CKB，最多八位小数；首次开通必须显式提供金额。`1000` 是本方总注入额，含 99 CKB 保留金额，因此初始可用余额为 901 CKB。Node3 和客户端共用 offckb #5；默认对方另注入 99 CKB，钱包总出资为 1099 CKB 加交易费。费用上限为每笔 1 CKB，出资、commitment 和关闭费率为 1000 shannons/1000 bytes；所有条款先保存在本地，返回提案必须与之相符。
@@ -175,15 +175,15 @@ lock args 和 address 使用 offckb 当前返回的值；`--config` 不改变默
 cargo test --manifest-path fiber-lsp-client/Cargo.toml prepare_shared_devnet_wallet_cells -- --ignored --nocapture
 ```
 
-`open-channel` / `close-channel` 是别名，`closeChannel` 也是 `closechannel` 的别名。三个通道命令均支持 `--config PATH`；开关通道支持 `--timeout SECONDS`，默认 120 秒。`closechannel --channel-id 0x...` 可指定当前账户的已绑定通道，只做协作关闭；有未结算 TLC、余额不一致或状态过期时拒绝关闭。
+子命令统一使用 `-` 分隔：`open-channel`、`close-channel` 和 `list-channel`；旧的无分隔及驼峰命令名不再支持。三个通道命令均支持 `--config PATH`；开关通道支持 `--timeout SECONDS`，默认 120 秒。`close-channel --channel-id 0x...` 可指定当前账户的已绑定通道，只做协作关闭；有未结算 TLC、余额不一致或状态过期时拒绝关闭。
 
-开通成功要求出资链上确认且达到 `ChannelReady`；关闭成功要求关闭交易确认并核对 #5 退款。`listChannel` 展示开通中、可用、关闭中、已关闭及失败状态、双方余额、交易 hash 与本地恢复阶段，不提交交易或签名。
+开通成功要求出资链上确认且达到 `ChannelReady`；关闭成功要求关闭交易确认并核对 #5 退款。`list-channel` 展示开通中、可用、关闭中、已关闭及失败状态、双方余额、交易 hash 与本地恢复阶段，不提交交易或签名。
 
 超时、网络失败或退出后，保留账户目录全部文件，使用原配置重新执行同一命令：
 
 ```bash
-./lsp-cli openchannel    # 恢复原开通；不需要再次提供金额
-./lsp-cli closechannel   # 恢复原协作关闭
+./lsp-cli open-channel    # 恢复原开通；不需要再次提供金额
+./lsp-cli close-channel   # 恢复原协作关闭
 ```
 
 不同金额会被拒绝；重复开通返回原可用通道，重复关闭核对并返回原关闭结果。当前服务端 / SDK 限制同一租户关闭后再次开通，客户端保留旧 binding 和历史并明确提示，不自动清理或重新注册。

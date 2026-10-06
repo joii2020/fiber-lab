@@ -10,7 +10,7 @@
 
 ## 背景和总体目标
 
-现有账户目录固定为 `.state/fiber-lsp-client/default/`。当前本地 LSP 与 SDK 保留成功通道绑定，关闭后原租户无法重新开通。CLI 的 Closed 错误仍提供无效的 openchannel 恢复命令，用户无法自然继续下一轮联调。
+现有账户目录固定为 `.state/fiber-lsp-client/default/`。当前本地 LSP 与 SDK 保留成功通道绑定，关闭后原租户无法重新开通。CLI 的 Closed 错误仍提供无效的 open-channel 恢复命令，用户无法自然继续下一轮联调。
 
 GitHub [设计 issue #1625](https://github.com/nervosnetwork/fiber/issues/1625) 提出每租户一条私有通道，但未明确禁止关闭后建立新通道；本地 `../fiber/docs/notes/hosted-lsp-remote-signer.md` 与 registry / opening 实现体现当前不可替换绑定的限制。尚未找到上游对此的永久设计理由，不将其描述为协议要求。
 
@@ -22,7 +22,7 @@ GitHub [设计 issue #1625](https://github.com/nervosnetwork/fiber/issues/1625) 
 - `archive-account [--account ID]` 归档指定账户，省略 ID 时选择当前默认账户；允许存在活跃、开通中或关闭中的通道。显示操作影响及后续查询、关闭、恢复命令，不以归档状态判断资金安全。
 - 归档默认账户后默认位置为空，不自动选取其他账户、不自动注册新账户。下次显式 `create-user` 创建新身份；若已有默认账户则沿用原恢复行为。
 - `list-accounts` 只读展示本地账户 ID、当前 / 归档标记、可用的 tenant_id 和本地生命周期阶段；本地摘要不能替代远端与链上查询。
-- `status`、`listChannel`、`openchannel`、`closechannel`、`create-user` 统一支持 `--account ID`。显式选择归档账户不会切换默认账户；不存在的 ID 拒绝，不能隐式创建身份。
+- `status`、`list-channel`、`open-channel`、`close-channel`、`create-user` 统一支持 `--account ID`。显式选择归档账户不会切换默认账户；不存在的 ID 拒绝，不能隐式创建身份。
 - 归档账户可以继续查询、恢复原开通意图、关闭通道以及恢复关闭操作；对已关闭账户发起新开通仍说明当前服务端限制，不生成新身份规避。
 - 重复归档幂等；重复关闭沿用现有恢复及退款核对语义。所有输出和恢复命令明确账户 ID，避免误操作默认账户。
 - 不加入服务端注销、凭证撤销、同租户通道替换、强制关闭、支付签名循环、账户删除或自动清理。当前可关闭的通道条件与签名策略不因归档扩大。
@@ -34,9 +34,9 @@ GitHub [设计 issue #1625](https://github.com/nervosnetwork/fiber/issues/1625) 
 ./lsp-cli list-accounts
 ./lsp-cli archive-account
 ./lsp-cli create-user
-./lsp-cli openchannel --funding-amount 1000
-./lsp-cli listChannel --account <旧账户ID>
-./lsp-cli closechannel --account <旧账户ID>
+./lsp-cli open-channel --funding-amount 1000
+./lsp-cli list-channel --account <旧账户ID>
+./lsp-cli close-channel --account <旧账户ID>
 ```
 
 ## 约束与依赖
@@ -74,8 +74,8 @@ GitHub [设计 issue #1625](https://github.com/nervosnetwork/fiber/issues/1625) 
 4. 创建新账户先分配 ID、建立独立目录并持久化清单关系，再开始原注册流程；中断后 default 指向同一待恢复账户，不能再次生成 RootKey。只有默认为空且未显式选 ID 时创建新身份。
 5. `archive-account` 解析目标，按固定“清单锁 → 账户锁”顺序加锁，重新核对目标后原子写归档标记；若为默认则清空默认 ID。不得执行 RPC、提交签名、关闭或移动目录。重复调用返回同一结果。
 6. 账户命令在短期持有清单锁时选定并取得账户锁，然后释放清单锁；完成后释放账户锁。长时间网络等待不占用清单锁，也不反向重新获取清单锁，避免死锁。若锁冲突采用现有明确拒绝 / 重试行为。
-7. 明确 ID 下 `create-user` 只恢复已登记账户；openchannel 仅按原意图恢复或原限制拒绝。closechannel 与 listChannel 的 --channel-id / tenant 归属核验保持原规则。
-8. 修改 `finish_command` 和状态输出，让超时 / 错误的恢复命令携带 --account 与 --config；Closed + openchannel 单独显示终态说明，不输出“再次 openchannel 可恢复”。
+7. 明确 ID 下 `create-user` 只恢复已登记账户；open-channel 仅按原意图恢复或原限制拒绝。close-channel 与 list-channel 的 --channel-id / tenant 归属核验保持原规则。
+8. 修改 `finish_command` 和状态输出，让超时 / 错误的恢复命令携带 --account 与 --config；Closed + open-channel 单独显示终态说明，不输出“再次 open-channel 可恢复”。
 9. `list-accounts` 不调用账户初始化或推进迁移 / 注册；无清单的旧 default 作为兼容记录只读展示。列出不可恢复账户的错误摘要，不打印身份秘密。
 
 实施顺序：账户清单与旧目录兼容 → 统一选择与命令参数 → 归档 / 列表与状态提示 → 恢复、隔离及并发验证 → 使用文档更新。每步保留清单与账户原文件的可恢复状态。
@@ -86,9 +86,9 @@ GitHub [设计 issue #1625](https://github.com/nervosnetwork/fiber/issues/1625) 
 
 ## 执行记录与恢复点
 
-已完成：新增 Rust 账户清单与统一选择层；实现 archive-account、list-accounts、所有客户端命令的 --account ID，以及 closeChannel 别名；旧 default 目录原地保留，归档后新账户使用独立目录；恢复提示带账户 ID，已关闭账户不再输出无效开通恢复命令；同步 README 与账户文档。
+已完成：新增 Rust 账户清单与统一选择层；实现 archive-account、list-accounts、所有客户端命令的 --account ID，以及 close-channel 指定账户关闭；旧 default 目录原地保留，归档后新账户使用独立目录；恢复提示带账户 ID，已关闭账户不再输出无效开通恢复命令；同步 README 与账户文档；按本次用户要求将通道子命令统一为 open-channel、close-channel、list-channel，移除旧别名，并同步恢复提示、测试与使用文档。
 剩余工作：真实 devnet 多账户协作关闭、退款验证与开发者验收。
-验证结果：46 项测试通过，1 项既有测试忽略；cargo fmt --check、Clippy --all-targets -D warnings、release 构建及 git diff --check 均通过；release list-accounts 只读识别现有 default 账户，closeChannel --help 显示 --account ID；账户选择、旧目录兼容、重复归档、锁冲突、未知 ID、损坏清单及目录缺失均有回归验证；归档 CloseRequested 账户后恢复原关闭请求的模拟 RPC 验证通过，新默认账户文件保持不变。
+验证结果：46 项测试通过，1 项既有测试忽略；cargo fmt --check、Clippy --all-targets -D warnings、release 构建及 git diff --check 均通过；release list-accounts 只读识别现有 default 账户，close-channel --help 显示 --account ID；账户选择、旧目录兼容、重复归档、锁冲突、未知 ID、损坏清单及目录缺失均有回归验证；归档 CloseRequested 账户后恢复原关闭请求的模拟 RPC 验证通过，新默认账户文件保持不变。本次命名统一后再次通过 46 项测试（1 项忽略）、格式检查、Clippy 和 release 构建；帮助输出使用统一命令名，旧名称拒绝解析。
 未验证项：真实 devnet 活跃通道归档后完整关闭及链上退款、两账户在线注册；未修改或归档现有运行账户。
 验收确认：待确认。
 恢复点：使用 release lsp-cli 在 devnet 按 README 的账户归档流程联调并验收；按用户要求提交本次实现与验证记录；保留本方案，待开发者验收后清理。

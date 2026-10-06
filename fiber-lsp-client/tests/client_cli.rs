@@ -18,9 +18,9 @@ fn client_commands_read_offckb_config_from_xdg_or_home() {
         for subcommand in [
             "create-user",
             "status",
-            "openchannel",
-            "closechannel",
-            "listChannel",
+            "open-channel",
+            "close-channel",
+            "list-channel",
         ] {
             let mut command = Command::new(env!("CARGO_BIN_EXE_fiber-lsp-client"));
             command
@@ -55,9 +55,9 @@ fn explicit_config_is_relative_to_cwd_and_needs_no_home() {
     for subcommand in [
         "create-user",
         "status",
-        "openchannel",
-        "closechannel",
-        "listChannel",
+        "open-channel",
+        "close-channel",
+        "list-channel",
     ] {
         let result = Command::new(env!("CARGO_BIN_EXE_fiber-lsp-client"))
             .current_dir(temp.path())
@@ -75,13 +75,7 @@ fn explicit_config_is_relative_to_cwd_and_needs_no_home() {
 
 #[test]
 fn lifecycle_help_and_amount_validation_need_no_configuration() {
-    for name in [
-        "openchannel",
-        "open-channel",
-        "closechannel",
-        "close-channel",
-        "listChannel",
-    ] {
+    for name in ["open-channel", "close-channel", "list-channel"] {
         let output = Command::new(env!("CARGO_BIN_EXE_fiber-lsp-client"))
             .args([name, "--help"])
             .env_remove("HOME")
@@ -89,6 +83,18 @@ fn lifecycle_help_and_amount_validation_need_no_configuration() {
             .output()
             .unwrap();
         assert!(output.status.success());
+    }
+    for name in ["openchannel", "closechannel", "closeChannel", "listChannel"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fiber-lsp-client"))
+            .args([name, "--help"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("unrecognized subcommand")
+        );
     }
     for amount in [
         "0",
@@ -99,7 +105,7 @@ fn lifecycle_help_and_amount_validation_need_no_configuration() {
         "18446744073709551616",
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_fiber-lsp-client"))
-            .args(["openchannel", "--funding-amount", amount])
+            .args(["open-channel", "--funding-amount", amount])
             .env_remove("HOME")
             .env_remove("XDG_DATA_HOME")
             .output()
