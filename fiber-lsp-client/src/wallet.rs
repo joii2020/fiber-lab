@@ -18,6 +18,12 @@ pub const CKB: u64 = 100_000_000;
 pub const FEE_RATE: u64 = 1000;
 pub const MAX_FEE: u64 = CKB;
 pub const RESERVE: u64 = 99 * CKB;
+pub const CLIENT_FUNDING_ACCOUNT: usize = 6;
+const LSP_FUNDING_ACCOUNT: usize = 5;
+
+fn legacy_wallet_account() -> usize {
+    LSP_FUNDING_ACCOUNT
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Terms {
@@ -27,11 +33,23 @@ pub struct Terms {
     pub funding_deps: Vec<ckb_jsonrpc_types::CellDep>,
     pub default_lock_dep: ckb_jsonrpc_types::CellDep,
     pub wallet_lock: ckb_jsonrpc_types::Script,
+    #[serde(default = "legacy_wallet_account")]
+    pub wallet_account: usize,
+    #[serde(default)]
+    pub remote_wallet_lock: Option<ckb_jsonrpc_types::Script>,
     pub remote_amount: u64,
     pub auto_accept_min: u64,
     pub max_fee: u64,
     pub funding_fee_rate: u64,
     pub close_fee_rate: u64,
+}
+
+impl Terms {
+    pub fn remote_wallet_lock(&self) -> &ckb_jsonrpc_types::Script {
+        self.remote_wallet_lock
+            .as_ref()
+            .unwrap_or(&self.wallet_lock)
+    }
 }
 
 pub struct Wallet {
@@ -108,8 +126,14 @@ impl Wallet {
             "合约部署 args 必须为空"
         );
         ensure!(!funding.cell_deps.is_empty(), "FundingLock cell deps 为空");
-        let wallet_lock = funding_account(false)?.lock_script;
+        let wallet_lock = funding_account(CLIENT_FUNDING_ACCOUNT, false)?.lock_script;
+        let remote_wallet_lock = funding_account(LSP_FUNDING_ACCOUNT, false)?.lock_script;
         validate_default_lock(&wallet_lock)?;
+        validate_default_lock(&remote_wallet_lock)?;
+        ensure!(
+            wallet_lock != remote_wallet_lock,
+            "客户端和 LSP 出资钱包必须不同"
+        );
         let chain = Rpc::new(&cfg.ckb.rpc_url)?;
         let genesis: ckb_jsonrpc_types::BlockView = chain
             .call("get_block_by_number", json!(["0x0"]), "")
@@ -138,6 +162,8 @@ impl Wallet {
                 .collect(),
             default_lock_dep: dep.into(),
             wallet_lock,
+            wallet_account: CLIENT_FUNDING_ACCOUNT,
+            remote_wallet_lock: Some(remote_wallet_lock),
             remote_amount: cfg
                 .fiber
                 .auto_accept_channel_ckb_funding_amount
@@ -176,15 +202,9 @@ impl Wallet {
                 .context("钱包容量溢出")?;
         }
         ensure!(
-            total
-                >= u128::from(amount)
-                    + u128::from(self.terms.remote_amount)
-                    + u128::from(self.terms.max_fee),
-            "#5 余额不足以覆盖双方注入额和交易费上限"
-        );
-        ensure!(
-            objects.len() >= 2,
-            "Node3 与客户端共用 #5，需要至少两个默认 lock live cells；请先准备 devnet 出资 cells，原账户已保留"
+            total >= u128::from(amount) + u128::from(self.terms.max_fee),
+            "#{} 余额不足以覆盖本方注入额和交易费上限",
+            self.terms.wallet_account
         );
         Ok(())
     }
@@ -306,8 +326,8 @@ impl Wallet {
             "对方注入额超出本地条款"
         );
         ensure!(
-            result.opening_context.remote_shutdown_script == self.terms.wallet_lock,
-            "共用钱包的对方退款脚本不一致"
+            &result.opening_context.remote_shutdown_script == self.terms.remote_wallet_lock(),
+            "LSP 退款脚本与保存的条款不一致"
         );
         let tx: packed::Transaction = result.unsigned_funding_tx.clone().into();
         let mut inputs = Vec::new();
@@ -322,30 +342,35 @@ impl Wallet {
         Ok(inputs)
     }
 
-    pub fn sign(&self, tx: packed::Transaction) -> Result<packed::Transaction> {
-        let account = funding_account(true)?;
+    pub fn sign(
+        &self,
+        tx: packed::Transaction,
+        cells: &[(packed::CellOutput, Vec<u8>)],
+    ) -> Result<packed::Transaction> {
+        let index = self.terms.wallet_account;
+        let account = funding_account(index, true)?;
         ensure!(
             account.lock_script == self.terms.wallet_lock,
-            "offckb #5 脚本与保存的条款不一致"
+            "offckb #{index} 脚本与保存的条款不一致"
         );
-        let secret = account.privkey.context("offckb #5 缺少私钥")?;
+        let secret = account
+            .privkey
+            .with_context(|| format!("offckb #{index} 缺少私钥"))?;
         let bytes = Zeroizing::new(
             hex::decode(secret.strip_prefix("0x").unwrap_or(&secret))
-                .map_err(|_| anyhow::anyhow!("offckb #5 私钥格式错误"))?,
+                .map_err(|_| anyhow::anyhow!("offckb #{index} 私钥格式错误"))?,
         );
         let key = secp256k1::SecretKey::from_slice(&bytes)
-            .map_err(|_| anyhow::anyhow!("offckb #5 私钥无效"))?;
+            .map_err(|_| anyhow::anyhow!("offckb #{index} 私钥无效"))?;
         let public = key.public_key(secp256k1::SECP256K1).serialize();
         let hash = ckb_hash::blake2b_256(public);
         let lock: packed::Script = self.terms.wallet_lock.clone().into();
         ensure!(
             lock.args().raw_data().as_ref() == &hash[..20],
-            "offckb #5 私钥与 lock args 不匹配"
+            "offckb #{index} 私钥与 lock args 不匹配"
         );
         let signer = SecpCkbRawKeySigner::new_with_secret_keys(vec![key]);
-        let mut group = ScriptGroup::from_lock_script(&lock);
-        // verify() proved that ALL inputs belong to this exact lock, including peer inputs.
-        group.input_indices = (0..tx.raw().inputs().len()).collect();
+        let group = wallet_signing_group(&tx, cells, &lock)?;
         sign_group(tx, &group, &signer, &hash[..20])
     }
 
@@ -384,7 +409,7 @@ fn validate_default_lock(script: &ckb_jsonrpc_types::Script) -> Result<()> {
         script.code_hash == ckb_sdk::constants::SIGHASH_TYPE_HASH
             && script.hash_type == ckb_jsonrpc_types::ScriptHashType::Type
             && script.args.len() == 20,
-        "offckb #5 必须使用默认 secp256k1_blake160_sighash_all lock"
+        "出资钱包必须使用默认 secp256k1_blake160_sighash_all lock"
     );
     Ok(())
 }
@@ -412,15 +437,24 @@ fn validate_funding(
         );
     }
     let wallet: packed::Script = terms.wallet_lock.clone().into();
+    let remote_wallet: packed::Script = terms.remote_wallet_lock().clone().into();
     let mut total = 0u128;
+    let mut local_inputs = 0u128;
+    let mut remote_inputs = 0u128;
     for (cell, data) in cells {
         ensure!(
-            cell.lock() == wallet && cell.type_().to_opt().is_none() && data.is_empty(),
+            (cell.lock() == wallet || cell.lock() == remote_wallet)
+                && cell.type_().to_opt().is_none()
+                && data.is_empty(),
             "出资 input 归属或资产错误"
         );
-        total = total
-            .checked_add(u128::from(u64::from(cell.capacity())))
-            .context("input 容量溢出")?;
+        let capacity = u128::from(u64::from(cell.capacity()));
+        if cell.lock() == wallet {
+            local_inputs += capacity;
+        } else {
+            remote_inputs += capacity;
+        }
+        total = total.checked_add(capacity).context("input 容量溢出")?;
     }
     ensure!(
         !raw.outputs().is_empty() && raw.outputs().len() == raw.outputs_data().len(),
@@ -440,12 +474,23 @@ fn validate_funding(
         "不可信通道合约"
     );
     let mut output_total = 0u128;
+    let mut local_change = 0u128;
+    let mut remote_change = 0u128;
     for (index, output) in raw.outputs().into_iter().enumerate() {
         ensure!(
             output.type_().to_opt().is_none() && raw.outputs_data().get(index).unwrap().is_empty(),
             "出资 output 资产或数据错误"
         );
-        ensure!(index == 0 || output.lock() == wallet, "找零未退回 #5");
+        if index != 0 {
+            let capacity = u128::from(u64::from(output.capacity()));
+            if output.lock() == wallet {
+                local_change += capacity;
+            } else if output.lock() == remote_wallet {
+                remote_change += capacity;
+            } else {
+                bail!("找零未退回原出资钱包");
+            }
+        }
         ensure!(
             !output.is_lack_of_capacity(ckb_types::core::Capacity::zero())?,
             "输出占用容量不足"
@@ -458,6 +503,22 @@ fn validate_funding(
         .checked_sub(output_total)
         .context("出资 outputs 超过 inputs")?;
     ensure!(fee <= u128::from(terms.max_fee), "出资费用超出钱包上限");
+    if wallet != remote_wallet {
+        let local_debit = local_inputs
+            .checked_sub(local_change)
+            .context("本方找零超过 inputs")?;
+        let remote_debit = remote_inputs
+            .checked_sub(remote_change)
+            .context("对方找零超过 inputs")?;
+        ensure!(
+            local_debit >= amount && local_debit <= amount + u128::from(terms.max_fee),
+            "本方钱包实际扣款与授权注入额或费用上限不符"
+        );
+        ensure!(
+            remote_debit >= u128::from(terms.remote_amount),
+            "LSP 未足额承担对方出资"
+        );
+    }
     let allowed: Vec<packed::CellDep> = vec![terms.default_lock_dep.clone().into()];
     let actual: Vec<_> = raw.cell_deps().into_iter().collect();
     ensure!(
@@ -467,6 +528,25 @@ fn validate_funding(
         "出资 cell deps 与可信部署不一致"
     );
     Ok(u64::try_from(fee)?)
+}
+
+fn wallet_signing_group(
+    tx: &packed::Transaction,
+    cells: &[(packed::CellOutput, Vec<u8>)],
+    lock: &packed::Script,
+) -> Result<ScriptGroup> {
+    ensure!(
+        cells.len() == tx.raw().inputs().len(),
+        "签名 inputs 缺少链上核验"
+    );
+    let mut group = ScriptGroup::from_lock_script(lock);
+    group.input_indices = cells
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (cell, _))| (cell.lock() == *lock).then_some(index))
+        .collect();
+    ensure!(!group.input_indices.is_empty(), "没有本方钱包可签名 inputs");
+    Ok(group)
 }
 
 fn sign_group(
@@ -544,7 +624,7 @@ fn offckb_script<'de, D: serde::Deserializer<'de>>(
     })
 }
 
-fn funding_account(private: bool) -> Result<FundingAccount> {
+fn funding_account(account_index: usize, private: bool) -> Result<FundingAccount> {
     let mut command = std::process::Command::new("offckb");
     command.args(["--json", "accounts"]);
     if private {
@@ -572,15 +652,15 @@ fn funding_account(private: bool) -> Result<FundingAccount> {
     for raw in data.accounts {
         let index: Index = serde_json::from_str(raw.get())
             .map_err(|_| anyhow::anyhow!("offckb accounts 索引无效"))?;
-        if index.index == 5 {
-            ensure!(selected.is_none(), "offckb 返回重复的 #5");
+        if index.index == account_index {
+            ensure!(selected.is_none(), "offckb 返回重复的 #{account_index}");
             selected = Some(raw);
         }
     }
-    let raw = selected.context("缺少 offckb #5")?;
+    let raw = selected.with_context(|| format!("缺少 offckb #{account_index}"))?;
     let account: FundingAccount = serde_json::from_str(raw.get())
-        .map_err(|_| anyhow::anyhow!("offckb #5 格式错误（输出已隐藏）"))?;
-    ensure!(account.index == 5, "错误出资账户");
+        .map_err(|_| anyhow::anyhow!("offckb #{account_index} 格式错误（输出已隐藏）"))?;
+    ensure!(account.index == account_index, "错误出资账户");
     Ok(account)
 }
 
@@ -594,6 +674,48 @@ impl FundingVerifier for Wallet {
         self.verify(request, result, true)
             .await
             .map_err(|e| SessionError::Invalid(format!("钱包拒绝出资：{e:#}")))
+    }
+}
+
+// Only live funding checks are needed for off-chain preimage release. On-chain
+// spending remains outside the CLI's authorized capabilities.
+#[async_trait::async_trait]
+impl fiber_lsp_sdk::ChainVerifier for Wallet {
+    async fn live_cell(
+        &self,
+        point: &packed::OutPoint,
+    ) -> std::result::Result<fiber_lsp_sdk::VerifiedCell, fiber_lsp_sdk::SignerError> {
+        let result = async {
+            self.check_network().await?;
+            let (output, data) = self.input_cell(point, true).await?;
+            Ok::<_, anyhow::Error>(fiber_lsp_sdk::VerifiedCell { output, data })
+        }
+        .await;
+        result.map_err(|e| {
+            fiber_lsp_sdk::SignerError::InvalidContent(format!("独立链上核验失败：{e:#}"))
+        })
+    }
+    async fn verify_commitment_lineage(
+        &self,
+        _: fiber_types::Hash256,
+        _: &packed::OutPoint,
+    ) -> std::result::Result<(), fiber_lsp_sdk::SignerError> {
+        Err(fiber_lsp_sdk::SignerError::InvalidContent(
+            "不支持链上追偿".into(),
+        ))
+    }
+    async fn verify_maturity(
+        &self,
+        _: &[packed::CellInput],
+    ) -> std::result::Result<(), fiber_lsp_sdk::SignerError> {
+        Err(fiber_lsp_sdk::SignerError::InvalidContent(
+            "不支持链上追偿".into(),
+        ))
+    }
+    async fn median_time_ms(&self) -> std::result::Result<u64, fiber_lsp_sdk::SignerError> {
+        Err(fiber_lsp_sdk::SignerError::InvalidContent(
+            "不支持链上追偿".into(),
+        ))
     }
 }
 
@@ -636,6 +758,8 @@ pub(crate) mod tests {
             ],
             default_lock_dep: packed::CellDep::default().into(),
             wallet_lock: lock.into(),
+            wallet_account: CLIENT_FUNDING_ACCOUNT,
+            remote_wallet_lock: None,
             remote_amount: RESERVE,
             auto_accept_min: 100 * CKB,
             max_fee: MAX_FEE,
@@ -822,72 +946,206 @@ pub(crate) mod tests {
             "peer's same-lock input must be in the group"
         );
     }
-    /// Explicit online test preparation: split one devnet wallet cell so the
-    /// tenant and public node can collect distinct inputs from their shared lock.
-    #[tokio::test]
-    #[ignore = "spends a devnet #5 cell; run explicitly for online lifecycle validation"]
-    async fn prepare_shared_devnet_wallet_cells() {
-        let wallet = Wallet::load(None).await.unwrap();
-        let result: Value = wallet.chain.call("get_cells", json!([{
-            "script": wallet.terms.wallet_lock, "script_type": "lock", "script_search_mode": "exact",
-            "filter": { "script_len_range": ["0x0", "0x1"], "output_data_len_range": ["0x0", "0x1"] }
-        }, "asc", "0x64"]), "").await.unwrap();
-        let cells = result["objects"].as_array().unwrap();
-        if cells.len() >= 2 {
-            println!("#5 already has multiple cells");
-            return;
-        }
-        assert_eq!(cells.len(), 1, "need one existing devnet #5 cell");
-        let point: ckb_jsonrpc_types::OutPoint =
-            serde_json::from_value(cells[0]["out_point"].clone()).unwrap();
-        let (cell, data) = wallet
-            .input_cell(&point.clone().into(), true)
-            .await
-            .unwrap();
-        assert!(data.is_empty() && cell.type_().to_opt().is_none());
-        let capacity = u64::from(cell.capacity());
-        assert!(capacity > 2200 * CKB);
-        let tx = TransactionBuilder::default()
-            .cell_dep(wallet.terms.default_lock_dep.clone())
-            .input(
-                packed::CellInput::new_builder()
-                    .previous_output(point)
-                    .build(),
+
+    fn separate_wallet_fixture() -> (
+        Terms,
+        packed::Transaction,
+        Vec<(packed::CellOutput, Vec<u8>)>,
+    ) {
+        let (mut terms, tx, _) = fixture();
+        let key = secp256k1::SecretKey::from_slice(&[8; 32]).unwrap();
+        let hash = ckb_hash::blake2b_256(key.public_key(secp256k1::SECP256K1).serialize());
+        let local: packed::Script = terms.wallet_lock.clone().into();
+        let remote = local.clone().as_builder().args(hash[..20].pack()).build();
+        terms.remote_wallet_lock = Some(remote.clone().into());
+        let cells = vec![remote.clone(), local.clone(), local.clone()]
+            .into_iter()
+            .map(|lock| {
+                (
+                    packed::CellOutput::new_builder()
+                        .lock(lock)
+                        .capacity(1000 * CKB)
+                        .build(),
+                    vec![],
+                )
+            })
+            .collect();
+        let tx = tx
+            .clone()
+            .into_view()
+            .as_advanced_builder()
+            .set_inputs(
+                (0u32..3)
+                    .map(|index| {
+                        packed::CellInput::new_builder()
+                            .previous_output(
+                                packed::OutPoint::new_builder()
+                                    .tx_hash([1; 32].pack())
+                                    .index(index)
+                                    .build(),
+                            )
+                            .build()
+                    })
+                    .collect(),
             )
-            .output(
+            .set_outputs(vec![
+                tx.raw().outputs().get(0).unwrap(),
                 packed::CellOutput::new_builder()
-                    .lock(cell.lock())
-                    .capacity(capacity / 2)
+                    .lock(local)
+                    .capacity(1000 * CKB - 600)
                     .build(),
-            )
-            .output_data(packed::Bytes::default())
-            .output(
                 packed::CellOutput::new_builder()
-                    .lock(cell.lock())
-                    .capacity(capacity - capacity / 2 - 1000)
+                    .lock(remote)
+                    .capacity(901 * CKB - 400)
                     .build(),
-            )
-            .output_data(packed::Bytes::default())
-            .witness(packed::Bytes::default())
+            ])
+            .set_outputs_data(vec![packed::Bytes::default(); 3])
+            .set_witnesses(vec![
+                packed::WitnessArgs::new_builder()
+                    .lock(Some([9u8; 65].pack()))
+                    .build()
+                    .as_bytes()
+                    .pack(),
+                packed::WitnessArgs::new_builder()
+                    .input_type(Some(ckb_types::bytes::Bytes::from_static(b"preserve")))
+                    .build()
+                    .as_bytes()
+                    .pack(),
+                packed::Bytes::default(),
+            ])
             .build()
             .data();
-        let signed = wallet.sign(tx).unwrap();
-        let hash: ckb_types::H256 = wallet
-            .chain
-            .call(
-                "send_transaction",
-                json!([ckb_jsonrpc_types::Transaction::from(signed), "passthrough"]),
-                "",
-            )
-            .await
-            .unwrap();
-        println!("#5 split transaction: {hash:#x}; fee: 1000 shannons");
-        for _ in 0..60 {
-            if wallet.committed_transaction(&hash).await.unwrap().is_some() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        (terms, tx, cells)
+    }
+
+    #[test]
+    fn separate_wallets_reject_shifted_contributions_and_missing_peer_funding() {
+        let (terms, tx, cells) = separate_wallet_fixture();
+        let amount = 1000u128 * u128::from(CKB);
+        assert_eq!(validate_funding(&tx, &cells, amount, &terms).unwrap(), 1000);
+        // Preserve total capacity and fee, but shift one CKB between wallets.
+        for shift_to_peer in [true, false] {
+            let local_change = if shift_to_peer {
+                999 * CKB - 600
+            } else {
+                1001 * CKB - 600
+            };
+            let remote_change = if shift_to_peer {
+                902 * CKB - 400
+            } else {
+                900 * CKB - 400
+            };
+            let bad = tx
+                .clone()
+                .into_view()
+                .as_advanced_builder()
+                .set_outputs(vec![
+                    tx.raw().outputs().get(0).unwrap(),
+                    tx.raw()
+                        .outputs()
+                        .get(1)
+                        .unwrap()
+                        .as_builder()
+                        .capacity(local_change)
+                        .build(),
+                    tx.raw()
+                        .outputs()
+                        .get(2)
+                        .unwrap()
+                        .as_builder()
+                        .capacity(remote_change)
+                        .build(),
+                ])
+                .build()
+                .data();
+            assert!(validate_funding(&bad, &cells, amount, &terms).is_err());
         }
-        panic!("split submitted but not confirmed; keep original data");
+        let mut bad_cells = cells.clone();
+        bad_cells[0].0 = bad_cells[0]
+            .0
+            .clone()
+            .as_builder()
+            .lock(terms.wallet_lock.clone())
+            .build();
+        assert!(validate_funding(&tx, &bad_cells, amount, &terms).is_err());
+    }
+
+    #[test]
+    fn separate_wallet_signature_only_changes_client_group() {
+        let (terms, tx, cells) = separate_wallet_fixture();
+        let key = secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
+        let signer = SecpCkbRawKeySigner::new_with_secret_keys(vec![key]);
+        let lock: packed::Script = terms.wallet_lock.into();
+        let group = wallet_signing_group(&tx, &cells, &lock).unwrap();
+        assert_eq!(group.input_indices, vec![1, 2]);
+        let signed = sign_group(tx.clone(), &group, &signer, &lock.args().raw_data()).unwrap();
+        assert_eq!(signed.raw().as_slice(), tx.raw().as_slice());
+        assert_eq!(signed.witnesses().get(0), tx.witnesses().get(0));
+        assert_eq!(signed.witnesses().get(2), tx.witnesses().get(2));
+        let witness =
+            packed::WitnessArgs::from_slice(&signed.witnesses().get(1).unwrap().raw_data())
+                .unwrap();
+        assert_eq!(
+            witness.input_type().to_opt().unwrap().raw_data().as_ref(),
+            b"preserve"
+        );
+        let bytes = witness.lock().to_opt().unwrap().raw_data();
+        let signature = secp256k1::ecdsa::RecoverableSignature::from_compact(
+            &bytes[..64],
+            secp256k1::ecdsa::RecoveryId::try_from(i32::from(bytes[64])).unwrap(),
+        )
+        .unwrap();
+        let message = generate_message(&signed.into_view(), &group, vec![0u8; 65].into()).unwrap();
+        assert_eq!(
+            secp256k1::SECP256K1
+                .recover_ecdsa(
+                    &secp256k1::Message::from_digest_slice(&message).unwrap(),
+                    &signature
+                )
+                .unwrap(),
+            key.public_key(secp256k1::SECP256K1)
+        );
+    }
+
+    #[test]
+    fn legacy_terms_keep_original_wallet_and_shared_input_signing() {
+        let (terms, tx, cells) = fixture();
+        let mut saved = serde_json::to_value(&terms).unwrap();
+        saved.as_object_mut().unwrap().remove("wallet_account");
+        saved.as_object_mut().unwrap().remove("remote_wallet_lock");
+        let restored: Terms = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.wallet_account, 5);
+        assert_eq!(restored.remote_wallet_lock(), &restored.wallet_lock);
+        assert_eq!(
+            validate_funding(&tx, &cells, 1000u128 * u128::from(CKB), &restored).unwrap(),
+            1000
+        );
+        let lock = restored.wallet_lock.into();
+        assert_eq!(
+            wallet_signing_group(&tx, &cells, &lock)
+                .unwrap()
+                .input_indices,
+            vec![0, 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn one_client_cell_only_needs_local_contribution_and_fee_budget() {
+        let (_root, config, listener) = crate::account::tests::fixture();
+        let mut terms = terms();
+        terms.ckb_rpc_url = config.rpc_url;
+        let capacity = 1000 * CKB + terms.max_fee;
+        let output = ckb_jsonrpc_types::CellOutput {
+            capacity: capacity.into(),
+            lock: terms.wallet_lock.clone(),
+            type_: None,
+        };
+        let server = crate::account::tests::serve(
+            listener,
+            vec![("get_cells", json!({"objects":[{"output":output}]}))],
+        );
+        let wallet = Wallet::from_terms(terms).unwrap();
+        wallet.check_capacity(1000 * CKB).await.unwrap();
+        server.join().unwrap();
     }
 }

@@ -15,13 +15,7 @@ fn client_commands_read_offckb_config_from_xdg_or_home() {
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         // Fail during configuration loading, before touching the real account.
         fs::write(&config, "rpc: {}\n").unwrap();
-        for subcommand in [
-            "create-user",
-            "status",
-            "open-channel",
-            "close-channel",
-            "list-channel",
-        ] {
+        for subcommand in ["create-user", "status", "open-channel", "close-channel"] {
             let mut command = Command::new(env!("CARGO_BIN_EXE_fiber-lsp-client"));
             command
                 .current_dir(temp.path())
@@ -52,13 +46,7 @@ fn explicit_config_is_relative_to_cwd_and_needs_no_home() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("custom.yml");
     fs::write(&config, "rpc: {}\n").unwrap();
-    for subcommand in [
-        "create-user",
-        "status",
-        "open-channel",
-        "close-channel",
-        "list-channel",
-    ] {
+    for subcommand in ["create-user", "status", "open-channel", "close-channel"] {
         let result = Command::new(env!("CARGO_BIN_EXE_fiber-lsp-client"))
             .current_dir(temp.path())
             .env_remove("HOME")
@@ -75,7 +63,17 @@ fn explicit_config_is_relative_to_cwd_and_needs_no_home() {
 
 #[test]
 fn lifecycle_help_and_amount_validation_need_no_configuration() {
-    for name in ["open-channel", "close-channel", "list-channel"] {
+    for name in [
+        "open-channel",
+        "close-channel",
+        "pay",
+        "create-invoice",
+        "watch",
+        "resume",
+        "payment-status",
+        "invoice-status",
+        "list-payments",
+    ] {
         let output = Command::new(env!("CARGO_BIN_EXE_fiber-lsp-client"))
             .args([name, "--help"])
             .env_remove("HOME")
@@ -84,7 +82,13 @@ fn lifecycle_help_and_amount_validation_need_no_configuration() {
             .unwrap();
         assert!(output.status.success());
     }
-    for name in ["openchannel", "closechannel", "closeChannel", "listChannel"] {
+    for name in [
+        "openchannel",
+        "closechannel",
+        "closeChannel",
+        "listChannel",
+        "list-channel",
+    ] {
         let output = Command::new(env!("CARGO_BIN_EXE_fiber-lsp-client"))
             .args([name, "--help"])
             .output()

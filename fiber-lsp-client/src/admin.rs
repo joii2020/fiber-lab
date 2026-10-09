@@ -1,20 +1,159 @@
 use std::{
     fs::{self, OpenOptions},
-    io::Read,
+    io::{Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use biscuit_auth::{Biscuit, KeyPair, PrivateKey, PublicKey};
 use clap::Args;
 use serde::Deserialize;
+use serde_yaml::{Mapping, Value};
 use zeroize::Zeroizing;
 
 use crate::store;
 
 pub const PERMISSIONS: &str = "read(\"lsp\"); write(\"lsp\"); read(\"node\");";
+
+#[derive(Args)]
+#[command(
+    after_help = "离线修改 offckb 已生成的节点配置，不启动节点。\n保留其他配置字段；YAML 注释和排版会重新生成。已有密钥复用，冲突时拒绝修改。"
+)]
+pub struct InitLsp {
+    /// 配置路径；默认 offckb Node3 的 config.yml
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+}
+
+pub struct InitializedLsp {
+    pub config: PathBuf,
+    pub private_key: PathBuf,
+}
+
+pub fn init_lsp(options: &InitLsp) -> Result<InitializedLsp> {
+    let config = crate::rpc::config_path(options.config.as_deref())?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&config)
+        .with_context(|| {
+            format!(
+                "无法读取配置 {}；请先用 offckb 初始化节点",
+                config.display()
+            )
+        })?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file(),
+        "配置必须是普通文件，不能是符号链接或目录"
+    );
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let mut document: Value = serde_yaml::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("{} 的 YAML 无效；原配置已保留", config.display()))?;
+    let root = document
+        .as_mapping_mut()
+        .context("配置必须是 YAML mapping")?;
+    add_to_list(root.get_mut("services"), &["lsp"], "services")?;
+    let fiber = root
+        .get_mut("fiber")
+        .and_then(Value::as_mapping_mut)
+        .context("缺少 fiber mapping；请使用 offckb 生成的配置")?;
+    fiber.insert("announced_node_name".into(), "fiber-lab-lsp".into());
+    let rpc = root
+        .get_mut("rpc")
+        .and_then(Value::as_mapping_mut)
+        .context("缺少 rpc mapping；请使用 offckb 生成的配置")?;
+    add_to_list(
+        rpc.get_mut("enabled_modules"),
+        &["lsp", "pubsub"],
+        "rpc.enabled_modules",
+    )?;
+    let public_text = optional_string(rpc, "biscuit_public_key")?;
+    let public = public_text
+        .map(|text| {
+            PublicKey::from_str(text)
+                .map_err(|_| anyhow::anyhow!("rpc.biscuit_public_key 无效；原配置已保留"))
+        })
+        .transpose()?;
+    let configured_path = optional_string(rpc, "biscuit_private_key_path")?;
+    let key_path = std::path::absolute(match configured_path {
+        Some(path) => PathBuf::from(path),
+        None => config
+            .parent()
+            .context("配置路径缺少父目录")?
+            .join("biscuit-private-key"),
+    })?;
+    let (key, new_key) = match fs::symlink_metadata(&key_path) {
+        Ok(_) => (read_keypair(&key_path)?, false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ensure!(
+                public.is_none() && configured_path.is_none(),
+                "配置中已有 Biscuit 密钥信息，但私钥文件缺失；拒绝重新生成，原配置已保留"
+            );
+            (KeyPair::new(), true)
+        }
+        Err(error) => return Err(error).context("无法检查 Biscuit 私钥文件"),
+    };
+    if let Some(public) = public {
+        ensure!(
+            key.public() == public,
+            "私钥与配置 rpc.biscuit_public_key 不匹配；原密钥与配置已保留"
+        );
+    }
+    rpc.insert("biscuit_public_key".into(), key.public().to_string().into());
+    rpc.insert(
+        "biscuit_private_key_path".into(),
+        key_path.to_str().context("私钥路径必须是 UTF-8")?.into(),
+    );
+    let yaml = serde_yaml::to_string(&document).context("无法编码 LSP 配置")?;
+    // Prepare the configuration before creating the key. Keep the original config permissions.
+    let mut temp = tempfile::NamedTempFile::new_in(config.parent().unwrap())?;
+    temp.as_file().set_permissions(metadata.permissions())?;
+    temp.write_all(yaml.as_bytes())?;
+    temp.as_file().sync_all()?;
+    if new_key {
+        let text = Zeroizing::new(format!("{}\n", key.private().to_prefixed_string()));
+        store::create_private(&key_path, text.as_bytes())?;
+    }
+    temp.persist(&config)
+        .map_err(|error| error.error)
+        .with_context(|| format!("无法保存 {}；已有私钥保留，可重试初始化", config.display()))?;
+    fs::File::open(config.parent().unwrap())?.sync_all()?;
+    Ok(InitializedLsp {
+        config,
+        private_key: key_path,
+    })
+}
+
+fn add_to_list(value: Option<&mut Value>, additions: &[&str], field: &str) -> Result<()> {
+    let list = value
+        .and_then(Value::as_sequence_mut)
+        .with_context(|| format!("{field} 必须是列表；请使用 offckb 生成的配置"))?;
+    ensure!(
+        list.iter().all(|item| item.as_str().is_some()),
+        "{field} 必须是字符串列表"
+    );
+    for addition in additions {
+        if !list
+            .iter()
+            .any(|item| item.as_str().unwrap().eq_ignore_ascii_case(addition))
+        {
+            list.push((*addition).into());
+        }
+    }
+    Ok(())
+}
+
+fn optional_string<'a>(mapping: &'a Mapping, field: &str) -> Result<Option<&'a str>> {
+    match mapping.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok((!text.trim().is_empty()).then_some(text.trim())),
+        Some(_) => bail!("rpc.{field} 必须是字符串；原配置已保留"),
+    }
+}
 
 #[derive(Args)]
 #[command(
@@ -86,11 +225,31 @@ pub fn create_token(options: &CreateToken) -> Result<CreatedToken> {
         .filter(|path| !path.as_os_str().is_empty())
         .context("缺少 rpc.biscuit_private_key_path；请补齐配置或指定 --private-key-file")?;
     let key_path = std::path::absolute(key_path)?;
+    let root = read_keypair(&key_path)?;
+    if root.public() != public {
+        bail!(
+            "私钥与配置 rpc.biscuit_public_key 不匹配；请核对 {} 和 {}",
+            key_path.display(),
+            config.display()
+        );
+    }
+    let token = Zeroizing::new(
+        Biscuit::builder()
+            .code(PERMISSIONS)?
+            .build(&root)?
+            .to_base64()
+            .context("无法编码管理凭证")?,
+    );
+    store::create_private(&output, token.as_bytes())?;
+    Ok(CreatedToken { config, output })
+}
+
+fn read_keypair(key_path: &Path) -> Result<KeyPair> {
     // Open without following a symlink and validate the opened file, avoiding a check/read race.
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&key_path)
+        .open(key_path)
         .with_context(|| {
             format!(
                 "无法读取私钥 {}；请检查路径，私钥必须是普通文件，不能是符号链接",
@@ -126,23 +285,7 @@ pub fn create_token(options: &CreateToken) -> Result<CreatedToken> {
             key_path.display()
         )
     })?;
-    let root = KeyPair::from(&private);
-    if root.public() != public {
-        bail!(
-            "私钥与配置 rpc.biscuit_public_key 不匹配；请核对 {} 和 {}",
-            key_path.display(),
-            config.display()
-        );
-    }
-    let token = Zeroizing::new(
-        Biscuit::builder()
-            .code(PERMISSIONS)?
-            .build(&root)?
-            .to_base64()
-            .context("无法编码管理凭证")?,
-    );
-    store::create_private(&output, token.as_bytes())?;
-    Ok(CreatedToken { config, output })
+    Ok(KeyPair::from(&private))
 }
 
 #[cfg(test)]

@@ -34,7 +34,8 @@ pub struct AccountStatus {
     pub outcome: &'static str,
     pub identity: Pubkey,
     pub tenant_id: String,
-    pub channel_count: usize,
+    pub client: ClientAccount,
+    pub channels: Vec<fiber_json_types::Channel>,
 }
 
 pub async fn run(config: &Config, create: bool, selected: Option<&str>) -> Result<AccountStatus> {
@@ -66,14 +67,29 @@ pub async fn run(config: &Config, create: bool, selected: Option<&str>) -> Resul
     let token = session
         .tenant_token()
         .context("账户缺少用户凭证；原数据已保留")?;
-    let channels = rpc.list_channels(token).await.with_context(|| {
+    let channels = if create {
+        rpc.list_channels(token).await
+    } else {
+        rpc.list_all_channels(token).await
+    }
+    .with_context(|| {
         format!("查询通道失败；已保存的账户保持不变，可再次执行 ./lsp-cli status --account {id}")
     })?;
     Ok(AccountStatus {
         outcome,
         identity: record.identity_public_key,
         tenant_id: record.tenant_id,
-        channel_count: channels.channels.len(),
+        client: ClientAccount {
+            dir,
+            session,
+            lsp_public_key: record.lsp_public_key.unwrap(),
+            invoice_public_key: record
+                .tenant
+                .as_ref()
+                .context("缺少租户发票公钥")?
+                .invoice_pubkey,
+        },
+        channels: channels.channels,
     })
 }
 
@@ -82,6 +98,7 @@ pub struct ClientAccount {
     pub dir: AccountDir,
     pub session: HostedSession<FileSignerStore>,
     pub lsp_public_key: Pubkey,
+    pub invoice_public_key: Pubkey,
 }
 
 impl ClientAccount {
@@ -96,6 +113,11 @@ impl ClientAccount {
             dir,
             session,
             lsp_public_key: record.lsp_public_key.unwrap(),
+            invoice_public_key: record
+                .tenant
+                .as_ref()
+                .context("缺少租户发票公钥")?
+                .invoice_pubkey,
         })
     }
 
@@ -301,7 +323,13 @@ pub async fn test_registered(config: &Config) -> ClientAccount {
         dir,
         session,
         lsp_public_key,
+        invoice_public_key: record.identity_public_key,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn save_test_state(dir: &AccountDir, state: &HostedSessionState) {
+    save_session(dir, state).unwrap();
 }
 
 #[cfg(test)]
@@ -399,7 +427,7 @@ pub(crate) mod tests {
                 assert_eq!(request["method"], method);
                 if matches!(
                     method,
-                    "get_block_hash" | "get_transaction" | "get_live_cell"
+                    "get_block_hash" | "get_transaction" | "get_live_cell" | "get_cells"
                 ) {
                     assert!(!headers.contains("authorization:"));
                 } else {
@@ -453,18 +481,21 @@ pub(crate) mod tests {
                 ("list_channels", json!({"channels": []})),
                 ("list_channels", json!({"channels": []})),
                 ("list_channels", json!({"channels": []})),
+                ("list_channels", json!({"channels": []})),
             ],
         );
         drop(dir);
         let created = run(&config, true, None).await.unwrap();
         assert_eq!(created.identity, identity);
         assert_eq!(created.tenant_id, id);
-        assert_eq!(created.channel_count, 0);
+        assert!(created.channels.is_empty());
+        drop(created);
         fs::remove_file(config.root.join("configs/keys/operator-token")).unwrap();
         let status = run(&config, false, None).await.unwrap();
-        let repeated = run(&config, true, None).await.unwrap();
         assert_eq!(status.identity, identity);
         assert_eq!(status.tenant_id, id);
+        drop(status);
+        let repeated = run(&config, true, None).await.unwrap();
         assert_eq!(repeated.tenant_id, id);
         server.join().unwrap();
     }

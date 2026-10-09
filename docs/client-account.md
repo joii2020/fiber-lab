@@ -1,6 +1,6 @@
 # 客户端账户
 
-本章解释 [注册账户并查询通道](../README.md#6-注册账户并查询通道) 使用的配置、SDK 身份和恢复流程。
+本章解释 [账户与通道](../README.md#6-账户与通道) 使用的配置、SDK 身份和恢复流程。
 
 ## 配置与命令
 
@@ -9,12 +9,11 @@
 ```bash
 ./lsp-cli create-user
 ./lsp-cli status
-./lsp-cli list-channel
 ./lsp-cli open-channel --funding-amount 1000
 ./lsp-cli close-channel
 ```
 
-客户端默认直接从 `${XDG_DATA_HOME:-$HOME/.local/share}/offckb-nodejs/devnet/fiber/nodes/3/config.yml` 读取 `rpc.listening_addr` 和 `rpc.biscuit_public_key`，与管理命令使用同一个 Node3 配置。管理 token 位于项目的 `configs/keys/operator-token`。
+客户端默认直接从 `${XDG_DATA_HOME:-$HOME/.local/share}/offckb-nodejs/devnet/fiber/nodes/3/config.yml` 读取 `rpc.listening_addr` 和 `rpc.biscuit_public_key`，与管理命令使用同一个 Node3 配置。管理 token 位于项目的 `configs/keys/operator-token`。客户端默认出资钱包为 offckb #6，LSP / Public T 保持使用 #5；`create-user` 创建的租户身份与 CKB 出资钱包独立。
 
 需要使用其他配置时，所有客户端命令都可传入 `--config PATH`，相对路径以当前工作目录为准：
 
@@ -25,7 +24,7 @@
 
 `--config` 只改变读取的配置文件；管理 token 和默认账户仍保存在项目目录。
 
-`create-user` 首次创建身份并注册，已有完整账户时恢复原账户。`status` 恢复账户，使用已保存的用户凭证调用 `list_channels`，输出身份公钥、`tenant_id` 和通道数量。账户不存在时，`status` 提示先执行 `create-user`。
+`create-user` 首次创建身份并注册，已有完整账户时恢复原账户。`status` 恢复账户，使用已保存的用户凭证调用 `list_channels`，合并已关闭及待处理通道记录，输出身份公钥、`tenant_id`、通道数量和通道详情。通道数量为 `0`、`1` 或 `1（已关闭）`，账户字段只打印一次。账户不存在时，`status` 提示先执行 `create-user`。
 
 直接执行 `./lsp-cli` 或使用 `-h` / `--help` 可查看命令说明，无需连接 LSP。
 
@@ -72,13 +71,13 @@
 
 通道命令读取同一账户，整个操作期间持有账户锁。SDK signer 和 session、原开通请求、签名交易及关闭条款会在相应外部操作前持久化；写入失败时停止。旧版 `account.json` 仍使用格式版本 1，无需迁移、注册或生成新根密钥。
 
-开通时从 Node3 的 CKB RPC、合约部署、链 spec 和 genesis 获取可信参数，保存 genesis hash、双方总注入额、默认 lock dep、费率及钱包费用上限。钱包在 Rust 进程中读取 #5 私钥并验证其公钥哈希，捕获 offckb 的 stdout / stderr；不打印、保存或传送私钥。通道 MuSig2 密钥仍来自 SDK，与出资钱包密钥独立。
+开通时从 Node3 的 CKB RPC、合约部署、链 spec 和 genesis 获取可信参数，保存 genesis hash、双方总注入额、默认 lock dep、费率及钱包费用上限。钱包在 Rust 进程中读取 #6 私钥并验证其公钥哈希，捕获 offckb 的 stdout / stderr；不打印、保存或传送私钥。通道 MuSig2 密钥仍来自 SDK，与出资钱包密钥独立。新开通记录同时保存本方 #6 和对方 #5 的钱包脚本及本方钱包编号；客户端独立核对双方实际出资和各自找零，只签名 #6 的 inputs，LSP 签名 #5 的 inputs。#6 余额只需覆盖本方注入额与费用上限，不再要求共用钱包的两个 cells。旧记录缺少新增字段时，继续按原 #5 钱包和原退款脚本恢复，不迁移或重建通道。
 
 `open-channel` 恢复时先查租户所有通道及 pending / failed 记录，签名前解析全部链上 inputs，核对通道输出、找零、费用和合约。出资提交前查链：`unknown` 可在仍等待外部出资时重发已保存的相同交易；`pending`、`proposed`、`committed` 不重复出资，`rejected` 停止。签名响应丢失后按当前 request ID 与完整请求复用本地签名，SDK 历史防止冲突签名。
 
 `close-channel` 从本地已验证的两条 commitment 核对余额和 TLC，独立计算关闭大小及客户端承担的费用，在请求前保存授权。恢复先查询状态：已在关闭中时处理原签名，已关闭时独立核对链上退款。原账户、binding、交易和失败记录均保留。
 
-阶段包括 `Opening`、`FundingSaved`、`FundingSubmitted`、`Ready`、`CloseRequested`、`Closing`、`Closed`。超时或失败打印当前阶段和恢复命令；`list-channel` 只读查询，不代替恢复命令推进操作。具体用法见 [通道生命周期](../README.md#7-开通查询和协作关闭)。
+阶段包括 `Opening`、`FundingSaved`、`FundingSubmitted`、`Ready`、`CloseRequested`、`Closing`、`Closed`。超时或失败打印当前阶段和恢复命令；`status` 只读查询，不代替恢复命令推进操作。具体用法见 [通道生命周期](../README.md#6-账户与通道)。
 
 ## 账户归档与历史账户
 
@@ -86,6 +85,6 @@
 
 `./lsp-cli archive-account` 归档当前账户并释放默认位置，保留所有原文件、SDK 安全状态和通道记录，不关闭通道或注销服务端租户。之后显式执行 `create-user` 才创建新身份。再次归档相同账户可使用 `archive-account --account ID`。
 
-`create-user`、`status`、`list-channel`、`open-channel`、`close-channel`均支持 `--account ID`。ID 直接取自 `list-accounts`，指定历史账户不会改变默认选择；`create-user --account ID` 只恢复已有身份。归档但尚未关闭的通道使用 `close-channel --account ID` 关闭，关闭中的操作也通过同一命令恢复。当前服务端仍限制同一租户关闭后再次开通。
+`create-user`、`status`、`open-channel`、`close-channel`均支持 `--account ID`。ID 直接取自 `list-accounts`，指定历史账户不会改变默认选择；`create-user --account ID` 只恢复已有身份。归档但尚未关闭的通道使用 `close-channel --account ID` 关闭，关闭中的操作也通过同一命令恢复。当前服务端仍限制同一租户关闭后再次开通。
 
 清单与账户分别持锁，按清单锁 → 账户锁顺序取得，网络操作期间只持有账户锁；并发归档或操作同一账户时明确拒绝并提示重试，不移动或清理目录。未知 ID、损坏清单或缺失目录拒绝操作并保留数据。

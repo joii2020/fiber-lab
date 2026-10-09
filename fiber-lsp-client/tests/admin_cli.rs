@@ -307,6 +307,7 @@ fn help_requires_no_configuration_or_accounts() {
         vec![],
         vec!["--help"],
         vec!["admin", "--help"],
+        vec!["admin", "init-lsp", "--help"],
         vec!["admin", "create-token", "--help"],
         vec!["create-user", "--help"],
         vec!["status", "--help"],

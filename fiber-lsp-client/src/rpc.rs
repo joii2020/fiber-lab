@@ -236,6 +236,15 @@ impl Rpc {
     }
 }
 
+#[derive(Debug)]
+pub struct MissingRecord;
+impl std::fmt::Display for MissingRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("远端明确返回记录不存在")
+    }
+}
+impl std::error::Error for MissingRecord {}
+
 fn decode_response<R: DeserializeOwned>(body: &[u8], id: u64, method: &str) -> Result<R> {
     // Raw response bodies and serde errors can contain credentials.
     let value: Value = serde_json::from_slice(body)
@@ -249,6 +258,15 @@ fn decode_response<R: DeserializeOwned>(body: &[u8], id: u64, method: &str) -> R
                 .get("code")
                 .and_then(Value::as_i64)
                 .context("数据解析错误：JSON-RPC 错误缺少 code")?;
+            // Classify only the exact missing-record responses of the current server.
+            // Never treat a transport/auth/parse error as absence.
+            let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+            if (method == "get_invoice" && message == "invoice not found")
+                || (method == "get_payment"
+                    && message.starts_with("InvalidParameter: Payment session not found: "))
+            {
+                return Err(MissingRecord.into());
+            }
             // Server messages/data can echo tokens; report only method and code.
             bail!("JSON-RPC 错误：{method} 返回 code {code}；请检查凭证和服务状态");
         }

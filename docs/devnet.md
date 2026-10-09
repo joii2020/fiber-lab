@@ -24,7 +24,9 @@
 
 本项目使用 Node1、Node2 作为普通 Fiber 节点，Node3 作为 LSP。
 
-首次初始化时，offckb 先启动三个普通节点，生成当前 devnet 的链配置、合约配置、RPC 地址、端口、CKB 私钥和密码。随后停止 Fiber，手动将 Node3 配置为 LSP。CKB 在配置期间继续运行，无需手动填写合约哈希或导入 CKB 私钥。
+首次初始化时，执行 `bash scripts/create.sh`。脚本通过 offckb 先启动三个普通节点，生成当前 devnet 的链配置、合约配置、RPC 地址、端口、CKB 私钥和密码。随后停止 Fiber，执行 `lsp-cli admin init-lsp` 将 Node3 配置为 LSP，再执行 `admin create-token` 生成管理凭证，最后调用 `start.sh` 启动普通节点与 LSP。CKB 在配置期间继续运行，无需手动填写合约哈希或导入 CKB 私钥。
+
+创建脚本要求 Node3 目录与管理 token 均不存在，已有环境时提前退出，避免 offckb 重写 Node3 配置。`clean.sh` 成功后可再次运行创建脚本；创建脚本不会自动清理任何数据。
 
 配置完成后，offckb 只管理 Node1、Node2；Shell 单独启动 Node3，复用其已有配置、密码和密钥。
 
@@ -33,7 +35,8 @@
 | CKB devnet | `http://127.0.0.1:8114` | — | — |
 | 普通 Fiber Node1 | `http://127.0.0.1:21714` | `8344` | `#3` |
 | 普通 Fiber Node2 | `http://127.0.0.1:21715` | `8345` | `#4` |
-| LSP / Node3 | `http://127.0.0.1:21716` | `8346` | `#5` |
+| LSP / Node3（Public T） | `http://127.0.0.1:21716` | `8346` | `#5` |
+| 客户端 lsp-cli | 连接 Node3 RPC | — | `#6` |
 
 ## 启动与停止脚本
 

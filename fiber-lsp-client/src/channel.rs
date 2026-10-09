@@ -31,7 +31,7 @@ pub struct OpenOptions {
     /// list-accounts 列出的账户 ID
     #[arg(long, value_name = "ID")]
     pub account: Option<String>,
-    /// 本方总注入额（含保留金额），最多八位小数；首次开通必填
+    /// 本方总注入额（CKB，含保留金额），最多八位小数；首次开通默认 1000，恢复时沿用原金额
     #[arg(long, value_parser = parse_amount)]
     pub funding_amount: Option<u64>,
     /// 等待最终状态的秒数；超时保留进度
@@ -108,6 +108,8 @@ struct Intent {
     funding_hash: Option<ckb_types::H256>,
     funding_fee: Option<u64>,
     close_authorization: Option<CloseAuthorization>,
+    #[serde(default)]
+    close_balances: Option<(u128, u128)>,
     close_transaction: Option<ckb_jsonrpc_types::Transaction>,
     close_hash: Option<ckb_types::H256>,
     pending_signature: Option<SubmitChannelSignatureParams>,
@@ -244,13 +246,17 @@ async fn open_inner(options: &OpenOptions, account: &mut ClientAccount, rpc: &Rp
                 intent.stage,
                 Stage::Closed | Stage::CloseRequested | Stage::Closing
             ),
-            "当前服务端 / SDK 限制同一租户关闭后再次开通；旧记录已保留，请用 ./lsp-cli list-channel 查询"
+            "当前服务端 / SDK 限制同一租户关闭后再次开通；旧记录已保留，请用 ./lsp-cli status 查询"
         );
         intent
     } else {
-        let funding = options
-            .funding_amount
-            .context("首次开通必须提供 --funding-amount，单位 CKB")?;
+        let funding = options.funding_amount.unwrap_or(1000 * CKB);
+        if options.funding_amount.is_none() {
+            println!(
+                "未指定 --funding-amount，本次默认出资 {} CKB",
+                amount(u128::from(funding))
+            );
+        }
         let wallet = Wallet::load(options.config.as_deref()).await?;
         ensure!(funding > RESERVE, "出资额必须大于 99 CKB 保留金额");
         ensure!(
@@ -294,6 +300,7 @@ async fn open_inner(options: &OpenOptions, account: &mut ClientAccount, rpc: &Rp
             funding_hash: None,
             funding_fee: None,
             close_authorization: None,
+            close_balances: None,
             close_transaction: None,
             close_hash: None,
             pending_signature: None,
@@ -305,7 +312,8 @@ async fn open_inner(options: &OpenOptions, account: &mut ClientAccount, rpc: &Rp
     let wallet = Wallet::from_terms(intent.terms.clone())?;
     wallet.check_network().await?;
     println!(
-        "本方注入 {} CKB，对方注入 {} CKB；共用 #5 总注入 {} CKB，另付交易费（上限 {} CKB）",
+        "本方 #{} 注入 {} CKB，对方注入 {} CKB；通道总注入 {} CKB，另付交易费（上限 {} CKB）",
+        intent.terms.wallet_account,
         amount(intent.request.funding_amount),
         amount(u128::from(intent.terms.remote_amount)),
         amount(intent.request.funding_amount + u128::from(intent.terms.remote_amount)),
@@ -332,10 +340,11 @@ async fn open_inner(options: &OpenOptions, account: &mut ClientAccount, rpc: &Rp
         let points = wallet.verify(&intent.request, &opening, true).await?;
         let tx: packed::Transaction = opening.unsigned_funding_tx.clone().into();
         let mut total = 0u128;
+        let mut cells = Vec::new();
         for point in points {
-            total += u128::from(u64::from(
-                wallet.input_cell(&point, true).await?.0.capacity(),
-            ));
+            let cell = wallet.input_cell(&point, true).await?;
+            total += u128::from(u64::from(cell.0.capacity()));
+            cells.push(cell);
         }
         let outputs: u128 = tx
             .raw()
@@ -346,7 +355,7 @@ async fn open_inner(options: &OpenOptions, account: &mut ClientAccount, rpc: &Rp
         intent.funding_fee = Some(u64::try_from(
             total.checked_sub(outputs).context("交易容量不一致")?,
         )?);
-        let signed = wallet.sign(tx)?;
+        let signed = wallet.sign(tx, &cells)?;
         intent.funding_hash = Some(signed.calc_tx_hash().unpack());
         intent.signed_funding = Some(signed.into());
         intent.stage = Stage::FundingSaved;
@@ -383,7 +392,9 @@ async fn open_inner(options: &OpenOptions, account: &mut ClientAccount, rpc: &Rp
                 confirmed.raw().as_slice() == original.raw().as_slice(),
                 "链上出资交易与原意图不一致"
             );
-            check_balances(channel, &intent)?;
+            if intent.stage != Stage::Ready {
+                check_balances(channel, &intent)?;
+            }
             intent.stage = Stage::Ready;
             save_intent(&account.dir, &intent)?;
             println!(
@@ -448,13 +459,17 @@ fn check_balances(channel: &Channel, intent: &Intent) -> Result<()> {
             && channel.received_tlc_balance == 0,
         "存在未结算 TLC；拒绝关闭或签名"
     );
+    let (local, remote) = intent.close_balances.unwrap_or((
+        intent.request.funding_amount,
+        u128::from(intent.terms.remote_amount),
+    ));
     ensure!(
         channel.local_balance.checked_add(u128::from(
             opening.opening_context.local_reserved_ckb_amount
-        )) == Some(intent.request.funding_amount)
+        )) == Some(local)
             && channel.remote_balance.checked_add(u128::from(
                 opening.opening_context.remote_reserved_ckb_amount
-            )) == Some(u128::from(intent.terms.remote_amount)),
+            )) == Some(remote),
         "远端余额与本地已验证余额不一致；状态待核对"
     );
     Ok(())
@@ -640,6 +655,10 @@ async fn close_inner(options: &CloseOptions, account: &mut ClientAccount, rpc: &
             channel.state == ChannelState::ChannelReady && intent.stage == Stage::Ready,
             "开通未完成或状态过期；先恢复 ./lsp-cli open-channel"
         );
+        let signer = account.session.channel_signer(id.into()).await?;
+        let records = signer.recovery_records().await?;
+        let (local, remote) = settled_balances(&records)?;
+        intent.close_balances = Some((local, remote));
         check_balances(channel, &intent)?;
         let hash = intent.funding_hash.as_ref().context("缺少出资 hash")?;
         let tx = wallet
@@ -677,24 +696,6 @@ async fn close_inner(options: &CloseOptions, account: &mut ClientAccount, rpc: &
             local_fee_share: fee,
             remote_fee_share: 0,
         });
-        // Only initial balances are supported. Compare both SDK-verified lanes,
-        // rather than trusting the RPC balance projection before sending shutdown.
-        let signer = account.session.channel_signer(id.into()).await?;
-        let records = signer.recovery_records().await?;
-        for lane in [false, true] {
-            let record = records
-                .iter()
-                .filter(|r| r.reference.for_remote == lane)
-                .max_by_key(|r| r.reference.version)
-                .context("缺少已验证 commitment；不能关闭")?;
-            ensure!(
-                record.settlement.data.tlcs.is_empty()
-                    && record.settlement.data.local_amount == intent.request.funding_amount
-                    && record.settlement.data.remote_amount
-                        == u128::from(intent.terms.remote_amount),
-                "本地 commitment 余额不一致或有未结算 TLC"
-            );
-        }
         intent.stage = Stage::CloseRequested;
         save_intent(&account.dir, &intent)?;
     }
@@ -716,7 +717,7 @@ async fn close_inner(options: &CloseOptions, account: &mut ClientAccount, rpc: &
             intent.stage = Stage::Closed;
             save_intent(&account.dir, &intent)?;
             println!(
-                "协作关闭成功（链上确认，#5 退款已核对）\nchannel ID：{id}\n关闭交易：{hash:#x}\n实际关闭费：{} shannons",
+                "协作关闭成功（链上确认，双方退款已核对）\nchannel ID：{id}\n关闭交易：{hash:#x}\n实际关闭费：{} shannons",
                 intent.close_authorization.as_ref().unwrap().fee
             );
             return Ok(());
@@ -814,14 +815,22 @@ fn validate_close_tx(tx: &packed::Transaction, intent: &Intent, wallet: &Wallet)
     let mut expected = vec![
         packed::CellOutput::new_builder()
             .capacity(
-                u64::try_from(intent.request.funding_amount)?
-                    .checked_sub(fee)
-                    .context("关闭费用超过余额")?,
+                u64::try_from(
+                    intent
+                        .close_balances
+                        .map_or(intent.request.funding_amount, |v| v.0),
+                )?
+                .checked_sub(fee)
+                .context("关闭费用超过余额")?,
             )
             .lock(intent.terms.wallet_lock.clone())
             .build(),
         packed::CellOutput::new_builder()
-            .capacity(intent.terms.remote_amount)
+            .capacity(u64::try_from(
+                intent
+                    .close_balances
+                    .map_or(u128::from(intent.terms.remote_amount), |v| v.1),
+            )?)
             .lock(opening.opening_context.remote_shutdown_script.clone())
             .build(),
     ];
@@ -893,24 +902,35 @@ fn finish_command(
             Some(Stage::Closed | Stage::Closing | Stage::CloseRequested)
         )
     {
-        return Err(error.context(format!("当前阶段：{stage}；旧记录保留。查询：./lsp-cli list-channel --account {account}{config}；账户管理：./lsp-cli list-accounts / archive-account --account {account}")));
+        return Err(error.context(format!("当前阶段：{stage}；旧记录保留。查询：./lsp-cli status --account {account}{config}；账户管理：./lsp-cli list-accounts / archive-account --account {account}")));
     }
-    Err(error.context(format!("当前阶段：{stage}；原数据保留。恢复命令：./lsp-cli {command} --account {account}{config}；查询：./lsp-cli list-channel --account {account}{config}")))
+    Err(error.context(format!("当前阶段：{stage}；原数据保留。恢复命令：./lsp-cli {command} --account {account}{config}；查询：./lsp-cli status --account {account}{config}")))
 }
 
-pub async fn list(config: &Config, selected: Option<&str>) -> Result<()> {
-    let account = ClientAccount::load(config, selected).await?;
-    let rpc = Rpc::new(&config.rpc_url)?;
-    let channels = rpc.list_all_channels(token(&account)?).await?;
+pub fn count(channels: &[Channel]) -> &'static str {
+    match channels.first() {
+        None => "0",
+        Some(channel) if matches!(channel.state, ChannelState::Closed(_)) => "1（已关闭）",
+        Some(_) => "1",
+    }
+}
+
+pub async fn print_details(account: &ClientAccount, channels: &[Channel]) -> Result<()> {
     let intent = read_intent(&account.dir)?;
     if let Some(intent) = &intent {
-        validate_owner(&account, intent)?;
+        validate_owner(account, intent)?;
     }
-    println!("tenant_id：{}", account.session.tenant_id());
-    if channels.channels.is_empty() {
-        println!("当前账户通道列表为空");
+    if channels.is_empty() {
+        println!(
+            "\n通道状态：{}",
+            if intent.is_some() {
+                "暂无远端通道记录"
+            } else {
+                "未创建"
+            }
+        );
     }
-    for channel in &channels.channels {
+    for channel in channels {
         let mut state = match channel.state {
             ChannelState::ChannelReady => "可用（远端；链上待核对）",
             ChannelState::ShuttingDown(_) => "关闭中",
@@ -952,25 +972,25 @@ pub async fn list(config: &Config, selected: Option<&str>) -> Result<()> {
             }
         }
         println!(
-            "channel ID：{}\n状态：{}\n双方通道余额：{} / {} CKB",
-            channel.channel_id,
+            "\n通道状态：{}\n  channel ID：{}\n  双方通道余额：{} / {} CKB",
             state,
+            channel.channel_id,
             amount(channel.local_balance),
             amount(channel.remote_balance)
         );
         if let Some(point) = &channel.channel_outpoint {
             let hash: ckb_types::H256 = point.tx_hash().unpack();
-            println!("出资交易：{hash:#x}");
+            println!("  出资交易：{hash:#x}");
         }
         if let Some(hash) = &channel.shutdown_transaction_hash {
-            println!("关闭交易：{hash:#x}");
+            println!("  关闭交易：{hash:#x}");
         }
     }
     if let Some(intent) = intent {
-        println!("本地阶段：{:?}", intent.stage);
+        println!("  本地阶段：{:?}", intent.stage);
         if !matches!(intent.stage, Stage::Ready | Stage::Closed) {
             println!(
-                "待恢复：./lsp-cli {} --account {}",
+                "  待恢复：./lsp-cli {} --account {}",
                 if intent.close_authorization.is_some() {
                     "close-channel"
                 } else {
@@ -980,10 +1000,60 @@ pub async fn list(config: &Config, selected: Option<&str>) -> Result<()> {
             );
         }
         if intent.stage == Stage::Closed {
-            println!("再次开通受当前服务端 / SDK 的同租户单通道记录限制；旧记录保留");
+            println!("  再次开通受当前服务端 / SDK 的同租户单通道记录限制；旧记录保留");
         }
     }
     Ok(())
+}
+
+/// The original verified opening context; no new wallet identity or funding.
+pub fn payment_context(account: &ClientAccount) -> Result<(Hash256, Wallet, u64, u64)> {
+    let intent = read_intent(&account.dir)?.context("缺少已验证开通条款")?;
+    validate_owner(account, &intent)?;
+    ensure!(
+        intent.stage == Stage::Ready,
+        "通道开通未完成或正在关闭；先核对通道生命周期"
+    );
+    let opening = intent.opening.context("缺少开通结果")?;
+    Ok((
+        opening.channel_id,
+        Wallet::from_terms(intent.terms)?,
+        opening.opening_context.local_reserved_ckb_amount,
+        opening.opening_context.remote_reserved_ckb_amount,
+    ))
+}
+
+pub fn settled_balances(records: &[fiber_lsp_sdk::RecoveryRecord]) -> Result<(u128, u128)> {
+    let lane = |remote| {
+        records
+            .iter()
+            .filter(|r| r.reference.for_remote == remote)
+            .max_by_key(|r| r.reference.version)
+            .context("缺少 SDK commitment lane")
+    };
+    let local = lane(false)?;
+    let remote = lane(true)?;
+    ensure!(
+        local.complete_signature.is_some(),
+        "本地 commitment 尚无完整恢复签名"
+    );
+    ensure!(
+        local.settlement.data.tlcs.is_empty() && remote.settlement.data.tlcs.is_empty(),
+        "本地仍有未结算 TLC"
+    );
+    let balance = (
+        local.settlement.data.local_amount,
+        local.settlement.data.remote_amount,
+    );
+    ensure!(
+        balance
+            == (
+                remote.settlement.data.local_amount,
+                remote.settlement.data.remote_amount
+            ),
+        "SDK 双 lane 余额尚未同步"
+    );
+    Ok(balance)
 }
 
 #[cfg(test)]
@@ -1064,6 +1134,7 @@ mod tests {
             funding_hash: None,
             funding_fee: None,
             close_authorization: None,
+            close_balances: None,
             close_transaction: None,
             close_hash: None,
             pending_signature: None,
@@ -1091,7 +1162,11 @@ mod tests {
                 ("list_channels", json!({"channels":[]})),
             ],
         );
-        list(&config, None).await.unwrap();
+        let status = crate::account::run(&config, false, None).await.unwrap();
+        assert_eq!(count(&status.channels), "0");
+        print_details(&status.client, &status.channels)
+            .await
+            .unwrap();
         server.join().unwrap();
         for (name, bytes) in originals {
             assert_eq!(
@@ -1178,12 +1253,111 @@ mod tests {
             .output(
                 packed::CellOutput::new_builder()
                     .capacity(RESERVE)
-                    .lock(record.terms.wallet_lock.clone())
+                    .lock(
+                        record
+                            .opening
+                            .as_ref()
+                            .unwrap()
+                            .opening_context
+                            .remote_shutdown_script
+                            .clone(),
+                    )
                     .build(),
             )
             .output_data(packed::Bytes::default())
             .build()
             .data()
+    }
+
+    #[tokio::test]
+    async fn separate_wallet_close_returns_each_balance_to_original_wallet() {
+        let (_root, config, _listener) = fixture();
+        let mut account = test_registered(&config).await;
+        let mut record = intent(&mut account).await;
+        let local: packed::Script = record.terms.wallet_lock.clone().into();
+        let remote = local.as_builder().args([8u8; 20].pack()).build();
+        record.terms.remote_wallet_lock = Some(remote.clone().into());
+        record
+            .opening
+            .as_mut()
+            .unwrap()
+            .opening_context
+            .remote_shutdown_script = remote.clone().into();
+        let wallet = Wallet::from_terms(record.terms.clone()).unwrap();
+        let fee = wallet.close_fee(remote).unwrap();
+        record.close_authorization = Some(CloseAuthorization {
+            fee,
+            local_fee_share: fee,
+            remote_fee_share: 0,
+        });
+        let tx = close_tx(&record, &wallet);
+        validate_close_tx(&tx, &record, &wallet).unwrap();
+        let bad = tx
+            .clone()
+            .into_view()
+            .as_advanced_builder()
+            .set_outputs(vec![
+                tx.raw().outputs().get(0).unwrap(),
+                tx.raw()
+                    .outputs()
+                    .get(1)
+                    .unwrap()
+                    .as_builder()
+                    .lock(record.terms.wallet_lock.clone())
+                    .build(),
+            ])
+            .build()
+            .data();
+        assert!(validate_close_tx(&bad, &record, &wallet).is_err());
+    }
+
+    #[tokio::test]
+    async fn close_after_payment_uses_persisted_settled_balances() {
+        let (_root, config, _listener) = fixture();
+        let mut account = test_registered(&config).await;
+        let mut record = intent(&mut account).await;
+        let wallet = Wallet::from_terms(record.terms.clone()).unwrap();
+        let fee = wallet
+            .close_fee(record.terms.wallet_lock.clone().into())
+            .unwrap();
+        record.close_authorization = Some(CloseAuthorization {
+            fee,
+            local_fee_share: fee,
+            remote_fee_share: 0,
+        });
+        record.close_balances = Some((u128::from(999 * CKB), u128::from(100 * CKB)));
+        let original = close_tx(&record, &wallet);
+        // One CKB moved to the peer; both destinations remain the original locks.
+        let updated = original
+            .clone()
+            .into_view()
+            .as_advanced_builder()
+            .set_outputs(vec![
+                original
+                    .raw()
+                    .outputs()
+                    .get(0)
+                    .unwrap()
+                    .as_builder()
+                    .capacity(999 * CKB - fee)
+                    .build(),
+                original
+                    .raw()
+                    .outputs()
+                    .get(1)
+                    .unwrap()
+                    .as_builder()
+                    .capacity(100 * CKB)
+                    .build(),
+            ])
+            .build()
+            .data();
+        validate_close_tx(&updated, &record, &wallet).unwrap();
+        assert!(validate_close_tx(&original, &record, &wallet).is_err());
+        save_intent(&account.dir, &record).unwrap();
+        let restored = read_intent(&account.dir).unwrap().unwrap();
+        assert_eq!(restored.close_balances, record.close_balances);
+        validate_close_tx(&updated, &restored, &wallet).unwrap();
     }
 
     #[tokio::test]
@@ -1487,6 +1661,18 @@ mod tests {
             "local_balance":format!("0x{:x}", 901*CKB),"remote_balance":"0x0","offered_tlc_balance":"0x0","received_tlc_balance":"0x0","pending_tlcs":[],
             "latest_commitment_transaction_hash":null,"created_at":"0x1","enabled":true,"tlc_expiry_delta":"0x0","tlc_fee_proportional_millionths":"0x0","shutdown_transaction_hash":null,"failure_detail":null,
         })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn channel_count_distinguishes_missing_open_and_closed() {
+        let (_root, config, _listener) = fixture();
+        let mut account = test_registered(&config).await;
+        let record = intent(&mut account).await;
+        let mut channel = channel_projection(&record);
+        assert_eq!(count(&[]), "0");
+        assert_eq!(count(std::slice::from_ref(&channel)), "1");
+        channel.state = ChannelState::Closed(fiber_json_types::CloseFlags::COOPERATIVE.into());
+        assert_eq!(count(&[channel]), "1（已关闭）");
     }
 
     #[tokio::test]
