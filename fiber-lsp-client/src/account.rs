@@ -19,6 +19,8 @@ enum Registration {
 
 #[derive(Deserialize, Serialize)]
 struct AccountRecord {
+    #[serde(default)]
+    user: Option<u8>,
     format_version: u32,
     rpc_url: String,
     rpc_auth_public_key: String,
@@ -38,15 +40,21 @@ pub struct AccountStatus {
     pub channels: Vec<fiber_json_types::Channel>,
 }
 
+#[cfg(test)]
 pub async fn run(config: &Config, create: bool, selected: Option<&str>) -> Result<AccountStatus> {
     let dir = crate::accounts::select(&config.root, selected, create)?;
+    run_dir(config, create, dir).await
+}
+
+pub async fn run_dir(config: &Config, create: bool, dir: AccountDir) -> Result<AccountStatus> {
     let id = dir.path.file_name().unwrap().to_string_lossy();
+    let recovery = registration_recovery(config, &id)?;
     let (mut record, mut session) = if dir.is_initialized()? {
         restore(&dir, config).await?
-    } else if create && selected.is_none() {
+    } else if create {
         initialize(&dir, config).await?
     } else {
-        bail!("账户不存在；请先执行 ./lsp-cli create-user");
+        bail!("账户不存在；请先执行 ./lsp-cli create-channel -u N");
     };
     let rpc = Rpc::new(&config.rpc_url)?;
     let outcome = if record.registration == Registration::Registered {
@@ -57,9 +65,7 @@ pub async fn run(config: &Config, create: bool, selected: Option<&str>) -> Resul
         }
     } else {
         if !create {
-            bail!(
-                "账户身份已保存，但注册尚未完成；请执行 ./lsp-cli create-user --account {id} 核对注册进度。原数据已保留"
-            );
+            bail!("账户身份已保存，但注册尚未完成；{recovery} 核对注册进度。原数据已保留");
         }
         register(&dir, config, &rpc, &mut record, &mut session).await?;
         "用户注册成功，账户已保存"
@@ -102,12 +108,18 @@ pub struct ClientAccount {
 }
 
 impl ClientAccount {
+    #[cfg(test)]
     pub async fn load(config: &Config, selected: Option<&str>) -> Result<Self> {
         let dir = crate::accounts::select(&config.root, selected, false)?;
+        Self::load_dir(config, dir).await
+    }
+
+    pub async fn load_dir(config: &Config, dir: AccountDir) -> Result<Self> {
         let id = dir.path.file_name().unwrap().to_string_lossy();
+        let recovery = registration_recovery(config, &id)?;
         let (record, session) = restore(&dir, config).await?;
         if record.registration != Registration::Registered {
-            bail!("账户注册尚未完成；请先执行 ./lsp-cli create-user --account {id}；原数据已保留");
+            bail!("账户注册尚未完成；{recovery}；原数据已保留");
         }
         Ok(Self {
             dir,
@@ -155,6 +167,10 @@ async fn initialize(
         .context("保存根密钥备份失败；尚未提交注册，原文件已保留")?;
     let session = HostedSession::new(created.root_signer);
     let record = AccountRecord {
+        user: crate::accounts::owner_for(
+            &config.root,
+            &dir.path.file_name().unwrap().to_string_lossy(),
+        )?,
         format_version: 1,
         rpc_url: config.rpc_url.clone(),
         rpc_auth_public_key: config.rpc_auth_public_key.clone(),
@@ -175,6 +191,13 @@ async fn restore(
     config: &Config,
 ) -> Result<(AccountRecord, HostedSession<FileSignerStore>)> {
     let record: AccountRecord = dir.read_json()?;
+    let owner = crate::accounts::owner_for(
+        &config.root,
+        &dir.path.file_name().unwrap().to_string_lossy(),
+    )?;
+    if record.user != owner {
+        bail!("账户永久用户归属与清单不一致；拒绝转移身份或租户");
+    }
     if record.format_version != 1 {
         bail!("account.json 的格式版本不支持；原文件已保留");
     }
@@ -273,7 +296,7 @@ async fn register(
     dir.save_json(record)
         .context("保存等待注册结果的进度失败；未提交注册")?;
     let result = rpc.register(&operator, params).await.context(
-        "注册结果待核对；本地身份与进度已保留，未自动重发。再次执行 ./lsp-cli create-user 会先核对服务端记录",
+        "注册结果待核对；本地身份与进度已保留，未自动重发。再次执行 ./lsp-cli create-channel -u N 会先核对服务端记录",
     )?;
     validate_tenant(&result.tenant, record)
         .context("注册响应无效，结果待核对；本地身份与进度已保留")?;
@@ -330,6 +353,28 @@ pub async fn test_registered(config: &Config) -> ClientAccount {
 #[cfg(test)]
 pub(crate) fn save_test_state(dir: &AccountDir, state: &HostedSessionState) {
     save_session(dir, state).unwrap();
+}
+
+/// Offline identity initialization; partial files are never replaced.
+pub async fn init_local(dir: &AccountDir, config: &Config) -> Result<()> {
+    if dir.is_initialized()? {
+        restore(dir, config).await?;
+    } else {
+        initialize(dir, config).await?;
+    }
+    Ok(())
+}
+
+fn registration_recovery(config: &Config, id: &str) -> Result<String> {
+    Ok(crate::accounts::owner_for(&config.root, id)?.map_or_else(
+        || "旧未绑定身份不能通过历史入口重新注册；保留资料核对原注册结果".into(),
+        |u| format!("执行 ./lsp-cli create-channel -u {u}，继续使用原 --config"),
+    ))
+}
+
+pub async fn verify_local(dir: &AccountDir, config: &Config) -> Result<()> {
+    restore(dir, config).await?;
+    Ok(())
 }
 
 #[cfg(test)]

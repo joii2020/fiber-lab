@@ -308,3 +308,27 @@ mod tests {
         );
     }
 }
+
+/// Validate the initialized LSP and public wallets before any user metadata is written.
+pub async fn init_accounts(options: &InitAccounts) -> Result<()> {
+    let config = crate::rpc::Config::load(options.config.as_deref())?;
+    let path = crate::rpc::config_path(options.config.as_deref())?;
+    let document: Value = serde_yaml::from_slice(&fs::read(path)?)?;
+    ensure!(
+        document["services"]
+            .as_sequence()
+            .is_some_and(|services| services.iter().any(|s| s.as_str() == Some("lsp"))),
+        "先执行 admin init-lsp 初始化 LSP 配置"
+    );
+    let bindings = (6..=9)
+        .map(crate::wallet::public_binding)
+        .collect::<Result<Vec<_>>>()?;
+    crate::accounts::init_users(&config, bindings).await
+}
+
+#[derive(Args)]
+pub struct InitAccounts {
+    /// 已初始化的 Node3 配置；仅离线读取，不修改 YAML 或 LSP 密钥
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+}

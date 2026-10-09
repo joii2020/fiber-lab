@@ -1,90 +1,34 @@
-# 客户端账户
+# 客户端用户、账户与恢复
 
-本章解释 [账户与通道](../README.md#6-账户与通道) 使用的配置、SDK 身份和恢复流程。
-
-## 配置与命令
-
-当前客户端支持一个默认账户，不需要额外账户参数：
+固定用户 1～4 永久使用 offckb #6～#9，LSP / Public T 使用 #5。用户编号与钱包不随通道轮次变化；SDK 身份和出资钱包是独立密钥。每轮账户及其 tenant_id 永久归属创建它的用户。
 
 ```bash
-./lsp-cli create-user
-./lsp-cli status
-./lsp-cli open-channel --funding-amount 1000
-./lsp-cli close-channel
+./lsp-cli admin init-lsp
+./lsp-cli admin init-accounts
+./lsp-cli accounts
+./lsp-cli create-channel -u 1 --funding-amount 1000
+./lsp-cli status -u 1
+./lsp-cli close-channel -u 1
+./lsp-cli accounts --history
+./lsp-cli create-channel -u 1
 ```
 
-客户端默认直接从 `${XDG_DATA_HOME:-$HOME/.local/share}/offckb-nodejs/devnet/fiber/nodes/3/config.yml` 读取 `rpc.listening_addr` 和 `rpc.biscuit_public_key`，与管理命令使用同一个 Node3 配置。管理 token 位于项目的 `configs/keys/operator-token`。客户端默认出资钱包为 offckb #6，LSP / Public T 保持使用 #5；`create-user` 创建的租户身份与 CKB 出资钱包独立。
+`init-lsp` 只配置 LSP 和 Biscuit 密钥。`init-accounts` 离线读取已初始化配置及 offckb 公开钱包，创建四份独立本地 SDK 身份，不连接 RPC、不注册、不读取管理 token、不更改 YAML 或 LSP 密钥。重复初始化保留当前/空闲状态及历史。初始化中断会保留已写入绑定、预留 ID 和身份；重试补全完成标记，若 SDK 文件不完整则拒绝重新生成密钥。
 
-需要使用其他配置时，所有客户端命令都可传入 `--config PATH`，相对路径以当前工作目录为准：
+默认配置为 `${XDG_DATA_HOME:-$HOME/.local/share}/offckb-nodejs/devnet/fiber/nodes/3/config.yml`，可用 `--config PATH` 指定。恢复核对保存的 RPC 地址、Biscuit 公钥、身份、tenant_id 及用户归属；不允许重绑另一服务或转移租户。
 
-```bash
-./lsp-cli create-user --config /path/to/node/config.yml
-./lsp-cli status --config /path/to/node/config.yml
-```
+`create-channel -u N` 在同一账户锁下注册并开通。已注册身份恢复不再读取管理 token；新注册使用 `configs/keys/operator-token`。注册请求发送前落盘等待标记；响应丢失先核对原租户，服务端存在而本地凭证缺失时明确停止，不盲目另注册。新意图默认 1000 CKB，恢复省略金额沿用原值。
 
-`--config` 只改变读取的配置文件；管理 token 和默认账户仍保存在项目目录。
+开通核对链、原条款、inputs、出资、找零和费率，出资签名仅签对应用户钱包的 inputs。提交前查链，已知交易不重复提交；签名响应丢失复用相同请求和本地签名，SDK 拒绝冲突签名。
 
-`create-user` 首次创建身份并注册，已有完整账户时恢复原账户。`status` 恢复账户，使用已保存的用户凭证调用 `list_channels`，合并已关闭及待处理通道记录，输出身份公钥、`tenant_id`、通道数量和通道详情。通道数量为 `0`、`1` 或 `1（已关闭）`，账户字段只打印一次。账户不存在时，`status` 提示先执行 `create-user`。
+`close-channel -u N` 继续使用 SDK 双 lane 最新结算余额，阻止未结算 TLC；链上关闭确认和双方退款核验完成后才归档。无通道不归档。归档只更新清单，保留目录、密钥和恢复资料；写清单失败时原关闭记录保留，重试关闭核验原结果后补归档。成功归档后用户空闲，重复关闭通过最近关闭账户核对原结果。下一次显式开通分配新身份和租户，旧租户始终属于原用户。归档不注销租户、不释放服务端名额。
 
-直接执行 `./lsp-cli` 或使用 `-h` / `--help` 可查看命令说明，无需连接 LSP。
+`accounts` 离线只读展示四用户和本地阶段，不要求配置、节点或 offckb 可用；`--history` 显示历轮和旧未绑定账户。本地 Ready 不代表实时可用，`status -u N` 再核对远端及链上；初始化未注册时 status 展示本地阶段而不注册，空闲时读取最近关闭摘要。查询不写回清单或 SDK。
 
-## 首次注册
+所有日常命令必须选择 `-u N`。status、close-channel、resume、payment-status、invoice-status、list-payments 支持互斥 `--account ID` 历史入口；pay、create-invoice、watch、create-channel 只处理用户当前轮次。历史入口使用该身份原凭证，不切换当前指针、不跨用户查 hash；当前轮次关闭必须用用户入口。
 
-客户端通过本地 `fiber-lsp-sdk` 管理身份和签名，通过自己的 HTTP 传输调用 LSP RPC。注册顺序是：
+锁顺序为用户锁 → 短清单锁 → 账户锁，清单锁不跨 RPC。关闭核验后释放账户锁，保持用户锁，再按清单锁 → 账户锁归档。锁非阻塞，竞争明确报错；新开通另持全局开通锁，避免共享 LSP #5 cell 冲突。
 
-1. 使用 SDK 的 `RootSigner::create_random` 创建身份，保存根密钥备份、SDK 存储及初始账户记录。
-2. 使用管理凭证调用 `lsp_get_status`，保存目标 LSP 的 Fiber 身份公钥。
-3. 调用 `lsp_list_tenants`，确认服务端尚未注册此身份。
-4. 调用 `lsp_get_tenant_registry_nonce`，由 SDK 检查随机数并通过 `begin_registration` 生成注册参数。
-5. 先保存“等待注册结果”状态，再调用 `lsp_register_tenant`。
-6. 核对返回的身份和用户记录，通过 SDK 的 `finish_registration` 保存用户凭证及会话状态。
-7. 使用用户凭证查询通道数量。
+v1 查询保留原格式和数据，不自动迁移；只有 init-accounts 升级为 v2，旧账户的 user 为 null，原 current 仅作为 legacy_current 展示。新账户目录是 `.state/fiber-lsp-client/accounts/<ID>/`，旧 default 目录不移动。root-key、signer.bin、account.json、channel.json 和 payments.json 必须一起保留，私密文件为 600。
 
-注册调用使用管理凭证，通道查询使用用户凭证。初次注册不会创建支付通道，正常通道数量为 `0`。
-
-## 本地存储
-
-旧账户目录为 `.state/fiber-lsp-client/default/`，新账户使用 `.state/fiber-lsp-client/accounts/<ID>/`；清单 `.state/fiber-lsp-client/accounts.json` 记录默认账户和归档状态。每个账户目录包含：
-
-| 文件 | 内容 |
-| --- | --- |
-| `root-key` | 32 字节 SDK 根密钥备份 |
-| `signer.bin` | SDK 签名存储的持久化快照 |
-| `account.json` | 身份公钥、`tenant_id`、关联 LSP、注册进度、用户记录及会话状态 |
-| `channel.json` | 开通后创建；可信网络和钱包条款、原始请求、冻结 / 签名交易、hash、处理阶段、关闭授权及待重发签名 |
-
-这些文件需要一起保留，才能恢复同一身份及其签名状态。账户目录权限为 `700`，账户文件权限为 `600`；目录锁防止多个进程同时修改同一账户。写入时保存完整快照，SDK 存储写入失败后停止继续操作。
-
-## 账户恢复与中断处理
-
-再次执行 `create-user` 或 `status` 时，客户端导入原根密钥并打开原 SDK 存储，检查账户身份、`tenant_id`、用户凭证和关联 LSP 的一致性。
-
-已完成注册的账户直接复用用户凭证，不需要重新生成管理 token 或重复注册。服务重启后，只要原节点、配置和账户数据仍在，就可以继续查询。
-
-账户绑定保存时的 RPC 地址和 Biscuit 公钥。当前配置与记录不一致时，客户端拒绝将原账户用于另一套服务；未完成的注册还会核对目标 LSP 的 Fiber 身份公钥。原先关联 Node4 的账户不会自动迁移到 Node3。
-
-注册中断后再次执行 `create-user`，客户端先核对服务端记录。只有确认用户尚不存在时，才继续注册。若服务端已经注册但本地没有保存用户凭证，命令会停止并保留原身份与进度：当前 RPC 不提供凭证找回接口，重复注册也不会重新签发用户 token。
-
-账户文件缺失、损坏或彼此不匹配时，客户端保留原文件并报错，不重新生成身份。具体排查见 [故障排查](troubleshooting.md#客户端账户问题)，SDK 接口说明见 [fiber-lsp-sdk README](../../fiber/crates/fiber-lsp-sdk/README.md)。
-
-## 通道意图与恢复
-
-通道命令读取同一账户，整个操作期间持有账户锁。SDK signer 和 session、原开通请求、签名交易及关闭条款会在相应外部操作前持久化；写入失败时停止。旧版 `account.json` 仍使用格式版本 1，无需迁移、注册或生成新根密钥。
-
-开通时从 Node3 的 CKB RPC、合约部署、链 spec 和 genesis 获取可信参数，保存 genesis hash、双方总注入额、默认 lock dep、费率及钱包费用上限。钱包在 Rust 进程中读取 #6 私钥并验证其公钥哈希，捕获 offckb 的 stdout / stderr；不打印、保存或传送私钥。通道 MuSig2 密钥仍来自 SDK，与出资钱包密钥独立。新开通记录同时保存本方 #6 和对方 #5 的钱包脚本及本方钱包编号；客户端独立核对双方实际出资和各自找零，只签名 #6 的 inputs，LSP 签名 #5 的 inputs。#6 余额只需覆盖本方注入额与费用上限，不再要求共用钱包的两个 cells。旧记录缺少新增字段时，继续按原 #5 钱包和原退款脚本恢复，不迁移或重建通道。
-
-`open-channel` 恢复时先查租户所有通道及 pending / failed 记录，签名前解析全部链上 inputs，核对通道输出、找零、费用和合约。出资提交前查链：`unknown` 可在仍等待外部出资时重发已保存的相同交易；`pending`、`proposed`、`committed` 不重复出资，`rejected` 停止。签名响应丢失后按当前 request ID 与完整请求复用本地签名，SDK 历史防止冲突签名。
-
-`close-channel` 从本地已验证的两条 commitment 核对余额和 TLC，独立计算关闭大小及客户端承担的费用，在请求前保存授权。恢复先查询状态：已在关闭中时处理原签名，已关闭时独立核对链上退款。原账户、binding、交易和失败记录均保留。
-
-阶段包括 `Opening`、`FundingSaved`、`FundingSubmitted`、`Ready`、`CloseRequested`、`Closing`、`Closed`。超时或失败打印当前阶段和恢复命令；`status` 只读查询，不代替恢复命令推进操作。具体用法见 [通道生命周期](../README.md#6-账户与通道)。
-
-## 账户归档与历史账户
-
-`./lsp-cli list-accounts` 只读展示本地账户 ID、当前 / 归档状态、tenant_id 及本地恢复阶段，不调用 RPC，不打印密钥或 token。旧 default 目录可以直接识别，无需移动文件；记录不完整时列表显示待恢复。
-
-`./lsp-cli archive-account` 归档当前账户并释放默认位置，保留所有原文件、SDK 安全状态和通道记录，不关闭通道或注销服务端租户。之后显式执行 `create-user` 才创建新身份。再次归档相同账户可使用 `archive-account --account ID`。
-
-`create-user`、`status`、`open-channel`、`close-channel`均支持 `--account ID`。ID 直接取自 `list-accounts`，指定历史账户不会改变默认选择；`create-user --account ID` 只恢复已有身份。归档但尚未关闭的通道使用 `close-channel --account ID` 关闭，关闭中的操作也通过同一命令恢复。当前服务端仍限制同一租户关闭后再次开通。
-
-清单与账户分别持锁，按清单锁 → 账户锁顺序取得，网络操作期间只持有账户锁；并发归档或操作同一账户时明确拒绝并提示重试，不移动或清理目录。未知 ID、损坏清单或缺失目录拒绝操作并保留数据。
+收付款和离线边界见 [付款流程](payment-flow.md)。

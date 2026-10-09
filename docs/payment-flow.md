@@ -1,6 +1,6 @@
 # 通道与收付款流程
 
-开通道、独立查询、协作关闭及收付款恢复命令已实现。当前版本的实际 devnet 收付款、离线和故障场景尚待验证，不能视为验收通过。命令见 [快速开始](../README.md)，验证记录见 [方案 2](../plans/2-lsp-cli-payments.md)。
+开通道、独立查询、协作关闭及收付款恢复命令已实现。四用户开关、退款和下一轮已通过实际 devnet 验证；完整收付款、离线和故障场景尚未通过。在线付款已复现 resolution 证据时序阻断及后续 ACK 超时强关，详见 [必要前置草案](../plans/draft-payment-resolution-prerequisite.md)，不能视为验收通过。命令见 [快速开始](../README.md)，验证记录见 [方案 2](../plans/2-lsp-cli-payments.md)。
 
 ## 联调路径与余额
 
@@ -19,28 +19,28 @@
 以下通道命令已实现：
 
 ```bash
-./lsp-cli create-user
-./lsp-cli open-channel --funding-amount 1000
-./lsp-cli status
+./lsp-cli admin init-accounts
+./lsp-cli create-channel --funding-amount 1000 -u 1
+./lsp-cli status -u 1
 ```
 
-开通使用已有账户及 LSP 公钥，读取本地 Node3 的链与通道配置，客户端从 offckb #6 出资，LSP / Public T 从 #5 出资。示例中本方 1000 CKB（含 99 CKB 保留金额）、对方默认 99 CKB，通道总出资为 1099 CKB 加实际交易费，#6 无需承担对方注入额。钱包核验双方 inputs、各自找零、合约、实际扣款和费用后，仅签名 #6 的 inputs，SDK 核验开通条款和初始 commitment；最终等待链上出资确认及 `ChannelReady`。
+开通使用已有账户及 LSP 公钥，读取本地 Node3 的链与通道配置，用户 1～4 分别从 offckb #6～#9 出资（示例用户 1 为 #6），LSP / Public T 从 #5 出资。示例中本方 1000 CKB（含 99 CKB 保留金额）、对方默认 99 CKB，通道总出资为 1099 CKB 加实际交易费，#6 无需承担对方注入额。钱包核验双方 inputs、各自找零、合约、实际扣款和费用后，仅签名 #6 的 inputs，SDK 核验开通条款和初始 commitment；最终等待链上出资确认及 `ChannelReady`。
 
-`status` 同时展示账户信息和当前账户的通道、余额、出资 / 关闭 hash 和待恢复阶段；查询不提交任何签名。中断后 `./lsp-cli open-channel` 核对并恢复原意图，不改变身份或重复出资。
+`status` 同时展示账户信息和当前账户的通道、余额、出资 / 关闭 hash 和待恢复阶段；查询不提交任何签名。中断后 `./lsp-cli create-channel -u 1` 核对并恢复原意图，不改变身份或重复出资。
 
 ```bash
-./lsp-cli close-channel
-./lsp-cli status
+./lsp-cli close-channel -u 1
+./lsp-cli status -u 1
 ```
 
-协作关闭要求本地已验证余额一致且没有未结算 TLC，退款使用开通时绑定的双方钱包脚本，新通道本方退回 #6、对方退回 #5；旧版共用 #5 的通道继续按原脚本核对。关闭费在本地独立计算，由发起方承担；只有关闭交易链上确认且退款匹配才报告成功。中断后重复 `close-channel` 继续原操作。当前同租户关闭后再开通受服务端 / SDK 单通道记录限制，旧记录保留。命令、金额及出资条件见 [README](../README.md#6-账户与通道)。
+协作关闭要求本地已验证余额一致且没有未结算 TLC，退款使用开通时绑定的双方钱包脚本，新通道本方退回所选用户的 #6～#9、对方退回 #5；旧版共用 #5 的通道继续按原脚本核对。关闭费在本地独立计算，由发起方承担；只有关闭交易链上确认且退款匹配才报告成功。中断后重复 `close-channel` 继续原操作。当前同租户关闭后再开通受服务端 / SDK 单通道记录限制，旧记录保留。命令、金额及出资条件见 [README](../README.md#6-四用户与通道)。
 
 ## 付款：接收对端发票
 
 普通节点 `new_invoice` 创建有签名的 devnet 固定金额 CKB 发票，例如 amount 为 `0x5f5e100`（1 CKB），currency 为 `Fibd`，expiry 为 `0xe10`（3600 秒）。交给客户端：
 
 ```bash
-./lsp-cli pay '<普通节点 invoice_address>' --max-fee 0.01 --timeout 120
+./lsp-cli pay '<普通节点 invoice_address>' --max-fee 0.01 --timeout 120 -u 1
 ```
 
 客户端本地解析并核验签名、网络、金额、资产和有效期，通过已绑定私有通道到 Public T 的 trampoline 付款；`max_parts=1`。trampoline 可能花费完整的费用预算，因此 SDK 授权的通道 TLC 金额是发票金额加原费用预算，而不只是发票金额。第一次付款显式传入 `--max-fee`，恢复保持原金额和费用，不改变路由授权。
@@ -52,9 +52,9 @@
 ## 创建发票：默认退出或在线等待
 
 ```bash
-./lsp-cli create-invoice --amount 1 --expiry 3600
-./lsp-cli create-invoice --amount 1 --expiry 3600 --wait
-./lsp-cli create-invoice --amount 1 --expiry 3600 --wait --timeout 120
+./lsp-cli create-invoice --amount 1 --expiry 3600 -u 1
+./lsp-cli create-invoice --amount 1 --expiry 3600 --wait -u 1
+./lsp-cli create-invoice --amount 1 --expiry 3600 --wait --timeout 120 -u 1
 ```
 
 首次显式指定金额；expiry 默认 3600 秒。客户端先生成并保存秘密和 SDK 授权，调用 `new_invoice` 时只提供 payment hash，生成 hold invoice。核对地址、hash、金额、有效期、算法、租户发票公钥及 Public T 路由提示，再保存、输出并刷新 stdout。
@@ -64,14 +64,14 @@
 ## 离线及中断恢复
 
 ```bash
-./lsp-cli resume --payment-hash 0x... --timeout 120
-./lsp-cli watch
-./lsp-cli payment-status --payment-hash 0x...
-./lsp-cli invoice-status --payment-hash 0x...
-./lsp-cli list-payments
+./lsp-cli resume --payment-hash 0x... --timeout 120 -u 1
+./lsp-cli watch -u 1
+./lsp-cli payment-status --payment-hash 0x... -u 1
+./lsp-cli invoice-status --payment-hash 0x... -u 1
+./lsp-cli list-payments -u 1
 ```
 
-所有命令支持 `--account ID` 和 `--config PATH`，显式选历史账户不改变默认账户。账户归档保留 `payments.json`、SDK store、密钥和秘密。`resume` 有界推进原操作；watch 前台持续推进全部原授权。同通道的签名可能同时涉及其他原授权操作。
+所有命令支持 `--config PATH`，日常操作必选 `-u N`。仅 resume、payment-status、invoice-status、list-payments 支持互斥 `--account ID` 历史入口；pay、create-invoice、watch 只处理用户当前轮次，用户空闲时不会回退历史。账户归档保留 `payments.json`、SDK store、密钥和秘密。`resume` 有界推进原操作；watch 前台持续推进全部原授权。同通道的签名可能同时涉及其他原授权操作。
 
 默认离线演示：创建发票 → CLI 输出后退出（停止同账户其他推进进程）→ 对端付款 → 有效窗口内 resume 或 watch 上线 → 签名、安全释放秘密、核对入账。对端离线期间可能处理中，不能先等付款成功再上线。CLI 退出仅停止签名，托管租户或私有通道可能继续运行；因此不能把退出宣称为真实 `Deferred`。
 

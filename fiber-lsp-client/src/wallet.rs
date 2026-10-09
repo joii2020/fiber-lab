@@ -18,6 +18,7 @@ pub const CKB: u64 = 100_000_000;
 pub const FEE_RATE: u64 = 1000;
 pub const MAX_FEE: u64 = CKB;
 pub const RESERVE: u64 = 99 * CKB;
+#[cfg(test)]
 pub const CLIENT_FUNDING_ACCOUNT: usize = 6;
 const LSP_FUNDING_ACCOUNT: usize = 5;
 
@@ -65,7 +66,10 @@ impl Wallet {
         })
     }
 
-    pub async fn load(config: Option<&Path>) -> Result<Self> {
+    pub async fn load(
+        config: Option<&Path>,
+        binding: &crate::accounts::FundingBinding,
+    ) -> Result<Self> {
         #[derive(Deserialize)]
         struct LocalConfig {
             fiber: FiberConfig,
@@ -126,7 +130,9 @@ impl Wallet {
             "合约部署 args 必须为空"
         );
         ensure!(!funding.cell_deps.is_empty(), "FundingLock cell deps 为空");
-        let wallet_lock = funding_account(CLIENT_FUNDING_ACCOUNT, false)?.lock_script;
+        let public = public_binding(binding.offckb_index)?;
+        ensure!(&public == binding, "用户钱包公开绑定与运行时 offckb 不一致");
+        let wallet_lock = public.lock_script;
         let remote_wallet_lock = funding_account(LSP_FUNDING_ACCOUNT, false)?.lock_script;
         validate_default_lock(&wallet_lock)?;
         validate_default_lock(&remote_wallet_lock)?;
@@ -162,7 +168,7 @@ impl Wallet {
                 .collect(),
             default_lock_dep: dep.into(),
             wallet_lock,
-            wallet_account: CLIENT_FUNDING_ACCOUNT,
+            wallet_account: binding.offckb_index,
             remote_wallet_lock: Some(remote_wallet_lock),
             remote_amount: cfg
                 .fiber
@@ -404,7 +410,7 @@ impl Wallet {
     }
 }
 
-fn validate_default_lock(script: &ckb_jsonrpc_types::Script) -> Result<()> {
+pub(crate) fn validate_default_lock(script: &ckb_jsonrpc_types::Script) -> Result<()> {
     ensure!(
         script.code_hash == ckb_sdk::constants::SIGHASH_TYPE_HASH
             && script.hash_type == ckb_jsonrpc_types::ScriptHashType::Type
@@ -598,6 +604,8 @@ struct FundingAccount {
     lock_script: ckb_jsonrpc_types::Script,
     #[serde(default, deserialize_with = "private_key")]
     privkey: Option<Zeroizing<String>>,
+    #[serde(default)]
+    address: String,
 }
 
 fn private_key<'de, D: serde::Deserializer<'de>>(
@@ -717,6 +725,17 @@ impl fiber_lsp_sdk::ChainVerifier for Wallet {
             "不支持链上追偿".into(),
         ))
     }
+}
+
+pub fn public_binding(index: usize) -> Result<crate::accounts::FundingBinding> {
+    let account = funding_account(index, false)?;
+    validate_default_lock(&account.lock_script)?;
+    ensure!(!account.address.is_empty(), "offckb #{index} address 为空");
+    Ok(crate::accounts::FundingBinding {
+        offckb_index: index,
+        lock_script: account.lock_script,
+        address: account.address,
+    })
 }
 
 #[cfg(test)]

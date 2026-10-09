@@ -25,12 +25,15 @@ use std::{
 };
 
 #[derive(Args)]
+#[group(skip)]
 pub struct OpenOptions {
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
-    /// list-accounts 列出的账户 ID
-    #[arg(long, value_name = "ID")]
+    /// 仅历史关闭入口
+    #[arg(long, value_name = "ID", hide = true)]
     pub account: Option<String>,
+    #[arg(short = 'u', long, value_parser = clap::value_parser!(u8).range(1..=4), required = true, conflicts_with = "account")]
+    pub user: Option<u8>,
     /// 本方总注入额（CKB，含保留金额），最多八位小数；首次开通默认 1000，恢复时沿用原金额
     #[arg(long, value_parser = parse_amount)]
     pub funding_amount: Option<u64>,
@@ -40,12 +43,16 @@ pub struct OpenOptions {
 }
 
 #[derive(Args)]
+#[group(skip)]
+#[command(group(clap::ArgGroup::new("close_selector").args(["user", "account"]).required(true).multiple(false)))]
 pub struct CloseOptions {
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
-    /// list-accounts 列出的账户 ID
+    /// accounts --history 列出的历史账户 ID
     #[arg(long, value_name = "ID")]
     pub account: Option<String>,
+    #[arg(short = 'u', long, value_parser = clap::value_parser!(u8).range(1..=4), conflicts_with = "account")]
+    pub user: Option<u8>,
     #[arg(long)]
     pub channel_id: Option<Hash256>,
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
@@ -207,24 +214,85 @@ impl TenantOpeningRpc for OpeningRpc<'_> {
 }
 
 pub async fn open(options: OpenOptions) -> Result<()> {
+    let client = crate::ClientOptions {
+        selector: crate::Selector {
+            user: options.user,
+            account: options.account.clone(),
+        },
+        config: options.config.clone(),
+    };
+    client.current_only()?;
     let config = Config::load(options.config.as_deref())?;
-    let mut account = ClientAccount::load(&config, options.account.as_deref()).await?;
+    let original_binding = crate::accounts::funding_for(&config.root, options.user.unwrap())?;
+    ensure!(
+        crate::wallet::public_binding(original_binding.offckb_index)? == original_binding,
+        "用户钱包公开绑定不一致；未分配身份或注册"
+    );
+    let (dir, selection) = crate::accounts::choose(&config.root, &client, true, false, true)?;
+    let binding = selection.funding.as_ref().unwrap();
+    ensure!(
+        original_binding == *binding,
+        "用户钱包公开绑定与运行时不一致；尚未注册"
+    );
+    let budget = tokio::time::Instant::now() + Duration::from_secs(options.timeout);
+    let mut account = tokio::time::timeout_at(budget, crate::account::run_dir(&config, true, dir))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "注册等待超时；恢复：./lsp-cli create-channel {}",
+                client.recovery_selector()
+            )
+        })??
+        .client;
     account.session = account.session.with_policy(SigningPolicy::Manual);
     let rpc = Rpc::new(&config.rpc_url)?;
-    let result = tokio::time::timeout(
-        Duration::from_secs(options.timeout),
-        open_inner(&options, &mut account, &rpc),
+    let result = tokio::time::timeout_at(
+        budget,
+        open_bound(
+            &options,
+            &mut account,
+            &rpc,
+            selection.funding.as_ref().unwrap(),
+        ),
     )
     .await;
     finish_command(
         result,
         &account.dir,
-        "open-channel",
+        "create-channel",
         options.config.as_ref(),
+        Some(&client),
     )
 }
 
+async fn open_bound(
+    options: &OpenOptions,
+    account: &mut ClientAccount,
+    rpc: &Rpc,
+    binding: &crate::accounts::FundingBinding,
+) -> Result<()> {
+    let current = crate::wallet::public_binding(binding.offckb_index)?;
+    ensure!(&current == binding, "用户固定钱包绑定不匹配");
+    if let Some(intent) = read_intent(&account.dir)? {
+        ensure!(
+            intent.terms.wallet_account == binding.offckb_index
+                && intent.terms.wallet_lock == binding.lock_script,
+            "原通道条款与用户永久钱包绑定不一致"
+        );
+    }
+    open_engine(options, account, rpc, Some(binding)).await
+}
+#[cfg(test)]
 async fn open_inner(options: &OpenOptions, account: &mut ClientAccount, rpc: &Rpc) -> Result<()> {
+    open_engine(options, account, rpc, None).await
+}
+
+async fn open_engine(
+    options: &OpenOptions,
+    account: &mut ClientAccount,
+    rpc: &Rpc,
+    binding: Option<&crate::accounts::FundingBinding>,
+) -> Result<()> {
     let remote = rpc.list_all_channels(token(account)?).await?;
     let loaded = read_intent(&account.dir)?;
     if loaded.is_none() {
@@ -257,7 +325,11 @@ async fn open_inner(options: &OpenOptions, account: &mut ClientAccount, rpc: &Rp
                 amount(u128::from(funding))
             );
         }
-        let wallet = Wallet::load(options.config.as_deref()).await?;
+        let wallet = Wallet::load(
+            options.config.as_deref(),
+            binding.context("新开通缺少用户钱包绑定")?,
+        )
+        .await?;
         ensure!(funding > RESERVE, "出资额必须大于 99 CKB 保留金额");
         ensure!(
             wallet.terms.auto_accept_min != 0 && funding >= wallet.terms.auto_accept_min,
@@ -593,8 +665,23 @@ async fn sign_status(
 }
 
 pub async fn close(options: CloseOptions) -> Result<()> {
+    let client = crate::ClientOptions {
+        selector: crate::Selector {
+            user: options.user,
+            account: options.account.clone(),
+        },
+        config: options.config.clone(),
+    };
     let config = Config::load(options.config.as_deref())?;
-    let mut account = ClientAccount::load(&config, options.account.as_deref()).await?;
+    let (dir, selection) = crate::accounts::choose(&config.root, &client, false, true, false)?;
+    crate::accounts::check_historical_close(&config.root, &selection)?;
+    let local: serde_json::Value = dir.read_json()?;
+    if local["registration"] != "registered" && read_intent(&dir)?.is_none() {
+        ensure!(options.channel_id.is_none(), "当前身份没有指定通道");
+        println!("当前身份尚未开通；没有可关闭通道，未归档");
+        return Ok(());
+    }
+    let mut account = ClientAccount::load_dir(&config, dir).await?;
     account.session = account.session.with_policy(SigningPolicy::Manual);
     let rpc = Rpc::new(&config.rpc_url)?;
     let result = tokio::time::timeout(
@@ -602,24 +689,50 @@ pub async fn close(options: CloseOptions) -> Result<()> {
         close_inner(&options, &mut account, &rpc),
     )
     .await;
-    finish_command(
+    let outcome = finish_command(
         result,
         &account.dir,
         "close-channel",
         options.config.as_ref(),
-    )
+        Some(&client),
+    )?;
+    drop(account);
+    if let CloseResult::ClosedVerified { channel_id, hash } = outcome {
+        crate::accounts::archive_verified(&config.root, &selection, channel_id, &hash)
+            .with_context(|| {
+                format!(
+                    "资金已关闭，归档待恢复；执行 ./lsp-cli close-channel {}",
+                    client.recovery_selector()
+                )
+            })?;
+    }
+    Ok(())
 }
-async fn close_inner(options: &CloseOptions, account: &mut ClientAccount, rpc: &Rpc) -> Result<()> {
+
+#[derive(Debug)]
+pub enum CloseResult {
+    NoChannel,
+    ClosedVerified {
+        channel_id: Hash256,
+        hash: ckb_types::H256,
+    },
+}
+
+async fn close_inner(
+    options: &CloseOptions,
+    account: &mut ClientAccount,
+    rpc: &Rpc,
+) -> Result<CloseResult> {
     let channels = rpc.list_all_channels(token(account)?).await?;
     if channels.channels.is_empty() {
         ensure!(options.channel_id.is_none(), "当前账户没有指定通道");
         let intent = read_intent(&account.dir)?;
         ensure!(
             intent.is_none(),
-            "本地有开通意图但远端尚无通道；先恢复 ./lsp-cli open-channel"
+            "本地有开通意图但远端尚无通道；先恢复 ./lsp-cli create-channel -u N"
         );
         println!("当前账户没有活动通道");
-        return Ok(());
+        return Ok(CloseResult::NoChannel);
     }
     let mut intent =
         read_intent(&account.dir)?.context("缺少已验证本地通道意图；不能授权退款或重建账户")?;
@@ -627,7 +740,7 @@ async fn close_inner(options: &CloseOptions, account: &mut ClientAccount, rpc: &
     let id = intent
         .opening
         .as_ref()
-        .context("开通未完成；先恢复 ./lsp-cli open-channel")?
+        .context("开通未完成；先恢复 ./lsp-cli create-channel -u N")?
         .channel_id;
     ensure!(
         options.channel_id.is_none_or(|value| value == id),
@@ -646,14 +759,17 @@ async fn close_inner(options: &CloseOptions, account: &mut ClientAccount, rpc: &
             .context("关闭交易尚未链上确认")?;
         println!(
             "通道已关闭\nchannel ID：{id}\n关闭交易：{:#x}",
-            intent.close_hash.unwrap()
+            intent.close_hash.as_ref().unwrap()
         );
-        return Ok(());
+        return Ok(CloseResult::ClosedVerified {
+            channel_id: id,
+            hash: intent.close_hash.clone().unwrap(),
+        });
     }
     if intent.close_authorization.is_none() {
         ensure!(
             channel.state == ChannelState::ChannelReady && intent.stage == Stage::Ready,
-            "开通未完成或状态过期；先恢复 ./lsp-cli open-channel"
+            "开通未完成或状态过期；先恢复 ./lsp-cli create-channel -u N"
         );
         let signer = account.session.channel_signer(id.into()).await?;
         let records = signer.recovery_records().await?;
@@ -720,7 +836,10 @@ async fn close_inner(options: &CloseOptions, account: &mut ClientAccount, rpc: &
                 "协作关闭成功（链上确认，双方退款已核对）\nchannel ID：{id}\n关闭交易：{hash:#x}\n实际关闭费：{} shannons",
                 intent.close_authorization.as_ref().unwrap().fee
             );
-            return Ok(());
+            return Ok(CloseResult::ClosedVerified {
+                channel_id: id,
+                hash,
+            });
         }
         match channel.state {
             ChannelState::ChannelReady => {
@@ -878,14 +997,15 @@ async fn verify_closed(
     Ok(Some(hash.clone()))
 }
 
-fn finish_command(
-    result: std::result::Result<Result<()>, tokio::time::error::Elapsed>,
+fn finish_command<T>(
+    result: std::result::Result<Result<T>, tokio::time::error::Elapsed>,
     dir: &AccountDir,
     command: &str,
     config: Option<&PathBuf>,
-) -> Result<()> {
+    selector: Option<&crate::ClientOptions>,
+) -> Result<T> {
     let error = match result {
-        Ok(Ok(())) => return Ok(()),
+        Ok(Ok(value)) => return Ok(value),
         Ok(Err(error)) => error,
         Err(_) => anyhow::anyhow!("等待超时，操作尚未完成"),
     };
@@ -896,15 +1016,11 @@ fn finish_command(
     let config = config
         .map(|p| format!(" --config {}", p.display()))
         .unwrap_or_default();
-    if command == "open-channel"
-        && matches!(
-            read_intent(dir)?.map(|i| i.stage),
-            Some(Stage::Closed | Stage::Closing | Stage::CloseRequested)
-        )
-    {
-        return Err(error.context(format!("当前阶段：{stage}；旧记录保留。查询：./lsp-cli status --account {account}{config}；账户管理：./lsp-cli list-accounts / archive-account --account {account}")));
-    }
-    Err(error.context(format!("当前阶段：{stage}；原数据保留。恢复命令：./lsp-cli {command} --account {account}{config}；查询：./lsp-cli status --account {account}{config}")))
+    let selector = selector.map_or_else(
+        || format!("--account {account}"),
+        crate::ClientOptions::recovery_selector,
+    );
+    Err(error.context(format!("当前阶段：{stage}；原数据保留。恢复命令：./lsp-cli {command} {selector}{config}；查询：./lsp-cli status {selector}{config}")))
 }
 
 pub fn count(channels: &[Channel]) -> &'static str {
@@ -990,13 +1106,17 @@ pub async fn print_details(account: &ClientAccount, channels: &[Channel]) -> Res
         println!("  本地阶段：{:?}", intent.stage);
         if !matches!(intent.stage, Stage::Ready | Stage::Closed) {
             println!(
-                "  待恢复：./lsp-cli {} --account {}",
+                "  待恢复：./lsp-cli {} {}",
                 if intent.close_authorization.is_some() {
                     "close-channel"
                 } else {
-                    "open-channel"
+                    "create-channel"
                 },
-                account.dir.path.file_name().unwrap().to_string_lossy()
+                {
+                    let id = account.dir.path.file_name().unwrap().to_string_lossy();
+                    crate::accounts::owner_for(&crate::accounts::root(), &id)?
+                        .map_or_else(|| format!("--account {id}"), |u| format!("-u {u}"))
+                }
             );
         }
         if intent.stage == Stage::Closed {
@@ -1194,6 +1314,7 @@ mod tests {
         );
         let options = OpenOptions {
             account: None,
+            user: None,
             config: None,
             funding_amount: Some(1001 * CKB),
             timeout: 1,
@@ -1548,6 +1669,7 @@ mod tests {
         let rpc = Rpc::new(&config.rpc_url).unwrap();
         let options = OpenOptions {
             account: None,
+            user: None,
             config: None,
             funding_amount: None,
             timeout: 1,
@@ -1766,6 +1888,7 @@ mod tests {
         );
         let options = CloseOptions {
             account: None,
+            user: None,
             config: None,
             channel_id: Some(Hash256([9; 32])),
             timeout: 1,

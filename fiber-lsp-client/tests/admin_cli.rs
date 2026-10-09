@@ -309,7 +309,8 @@ fn help_requires_no_configuration_or_accounts() {
         vec!["admin", "--help"],
         vec!["admin", "init-lsp", "--help"],
         vec!["admin", "create-token", "--help"],
-        vec!["create-user", "--help"],
+        vec!["create-channel", "--help"],
+        vec!["admin", "init-accounts", "--help"],
         vec!["status", "--help"],
     ] {
         let result = Command::new(env!("CARGO_BIN_EXE_fiber-lsp-client"))

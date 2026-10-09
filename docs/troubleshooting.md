@@ -45,11 +45,13 @@ offckb accounts
 | 现象 | 处理方式 |
 | --- | --- |
 | 无法读取 LSP 配置 | 核对 offckb Node3 的 `config.yml` 及 `XDG_DATA_HOME` / `HOME`；使用其他配置时传入 `--config PATH` |
-| `status` 提示账户不存在 | 先执行 `./lsp-cli create-user` |
-| 注册尚未完成 | 再次执行 `./lsp-cli create-user`，让客户端先核对服务端记录 |
+| 固定用户尚未初始化 | 先执行 `./lsp-cli admin init-accounts`；随后 `create-channel -u N` |
+| 注册尚未完成 | 再次执行 `./lsp-cli create-channel -u N`，让客户端先核对服务端记录 |
 | 服务端已有用户，但本地缺少用户凭证 | 保留原账户与进度；当前 RPC 无法找回凭证，重复注册也不会重新签发 |
 | RPC 地址或 Biscuit 公钥与保存的账户不一致 | 检查是否连接原来的 LSP；原账户不能直接用于另一套服务 |
 | 账户文件缺失、损坏或不匹配 | 核对并恢复同一份备份中的 `root-key`、`signer.bin`、`account.json`，保留原文件 |
 | 账户正在被其他进程使用 | 等待正在使用该账户的命令结束后重试 |
 
-账户恢复规则见 [客户端账户](client-account.md#账户恢复与中断处理)，节点和凭证的保存位置见 [运行数据](devnet.md#运行数据)。
+账户恢复规则见 [客户端账户](client-account.md)，节点和凭证的保存位置见 [运行数据](devnet.md#运行数据)。
+
+2026-10-09 真实收付款验证发现：客户端 get_payment 尚为 Inflight 且无 preimage 时，移除 TLC 签名被 SDK 拒绝；服务端一般 peer ACK 超时还可能强关通道。此时保留原 hash、账户目录与用户指针，查询实际链上状态，不将远端 Closed 当作已核验协作退款或通过归档/新付款绕过。必要服务端前置尚待确认，详细证据见 [前置草案](../plans/draft-payment-resolution-prerequisite.md)。

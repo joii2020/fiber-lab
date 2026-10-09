@@ -288,8 +288,11 @@ async fn ready_channel(account: &ClientAccount, rpc: &Rpc, id: Hash256) -> Resul
 }
 
 pub async fn pay(options: PayOptions) -> Result<()> {
+    options.client.current_only()?;
     let config = Config::load(options.client.config.as_deref())?;
-    let mut account = ClientAccount::load(&config, options.client.account.as_deref()).await?;
+    let (dir, _selection) =
+        crate::accounts::choose(&config.root, &options.client, false, false, false)?;
+    let mut account = ClientAccount::load_dir(&config, dir).await?;
     account.session = account.session.with_policy(SigningPolicy::Manual);
     let rpc = Rpc::new(&config.rpc_url)?;
     let parsed = invoice(&options.invoice)?;
@@ -367,8 +370,11 @@ pub async fn pay(options: PayOptions) -> Result<()> {
 }
 
 pub async fn create_invoice(options: InvoiceOptions) -> Result<()> {
+    options.client.current_only()?;
     let config = Config::load(options.client.config.as_deref())?;
-    let mut account = ClientAccount::load(&config, options.client.account.as_deref()).await?;
+    let (dir, _selection) =
+        crate::accounts::choose(&config.root, &options.client, false, false, false)?;
+    let mut account = ClientAccount::load_dir(&config, dir).await?;
     account.session = account.session.with_policy(SigningPolicy::Manual);
     let rpc = Rpc::new(&config.rpc_url)?;
     let (id, wallet, _, _) = channel::payment_context(&account)?;
@@ -547,8 +553,11 @@ fn print_invoice(op: &Operation) {
     );
 }
 fn recovery(account: &ClientAccount, hash: Hash256, options: &crate::ClientOptions) {
-    let id = account.dir.path.file_name().unwrap().to_string_lossy();
-    println!("恢复：./lsp-cli resume --payment-hash {hash} --account {id}");
+    let _ = account;
+    println!(
+        "恢复：./lsp-cli resume --payment-hash {hash} {}",
+        options.recovery_selector()
+    );
     if let Some(path) = &options.config {
         println!("恢复时继续使用 --config {}", path.display());
     }
@@ -557,7 +566,8 @@ fn recovery(account: &ClientAccount, hash: Hash256, options: &crate::ClientOptio
 pub async fn resume(options: ResumeOptions) -> Result<()> {
     let client = &options.operation.client;
     let config = Config::load(client.config.as_deref())?;
-    let mut account = ClientAccount::load(&config, client.account.as_deref()).await?;
+    let (dir, _selection) = crate::accounts::choose(&config.root, client, false, false, false)?;
+    let mut account = ClientAccount::load_dir(&config, dir).await?;
     account.session = account.session.with_policy(SigningPolicy::Manual);
     let rpc = Rpc::new(&config.rpc_url)?;
     let mut book = Book::load(&account)?;
@@ -573,8 +583,10 @@ pub async fn resume(options: ResumeOptions) -> Result<()> {
     .await
 }
 pub async fn watch(options: crate::ClientOptions) -> Result<()> {
+    options.current_only()?;
     let config = Config::load(options.config.as_deref())?;
-    let mut account = ClientAccount::load(&config, options.account.as_deref()).await?;
+    let (dir, _selection) = crate::accounts::choose(&config.root, &options, false, false, true)?;
+    let mut account = ClientAccount::load_dir(&config, dir).await?;
     account.session = account.session.with_policy(SigningPolicy::Manual);
     let rpc = Rpc::new(&config.rpc_url)?;
     let mut book = Book::load(&account)?;
@@ -1028,7 +1040,9 @@ fn print_local(op: &Operation) {
 }
 pub async fn status(options: HashOptions, inbound: bool) -> Result<()> {
     let config = Config::load(options.client.config.as_deref())?;
-    let account = ClientAccount::load(&config, options.client.account.as_deref()).await?;
+    let (dir, _selection) =
+        crate::accounts::choose(&config.root, &options.client, false, false, false)?;
+    let account = ClientAccount::load_dir(&config, dir).await?;
     let book = Book::load(&account)?;
     let op = &book.operations[book.index(options.payment_hash)?];
     ensure!(
@@ -1060,7 +1074,8 @@ pub async fn status(options: HashOptions, inbound: bool) -> Result<()> {
 }
 pub async fn list(options: crate::ClientOptions) -> Result<()> {
     let config = Config::load(options.config.as_deref())?;
-    let account = ClientAccount::load(&config, options.account.as_deref()).await?;
+    let (dir, _selection) = crate::accounts::choose(&config.root, &options, false, false, false)?;
+    let account = ClientAccount::load_dir(&config, dir).await?;
     let book = Book::load(&account)?;
     println!("本地收付款记录：{}（未查询远端）", book.operations.len());
     for op in &book.operations {
@@ -1289,7 +1304,8 @@ mod tests {
         use clap::Parser;
         assert!(crate::Cli::try_parse_from(["lsp-cli", "pay", "invoice"]).is_err());
         assert!(
-            crate::Cli::try_parse_from(["lsp-cli", "pay", "invoice", "--max-fee", "0"]).is_ok()
+            crate::Cli::try_parse_from(["lsp-cli", "pay", "invoice", "--max-fee", "0", "-u", "1"])
+                .is_ok()
         );
         assert!(crate::Cli::try_parse_from(["lsp-cli", "create-invoice"]).is_err());
         assert!(
@@ -1310,6 +1326,8 @@ mod tests {
                 "--amount",
                 "1",
                 "--wait",
+                "-u",
+                "1",
                 "--timeout",
                 "1"
             ])
