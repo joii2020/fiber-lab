@@ -1,6 +1,6 @@
 # 客户端用户、账户与恢复
 
-固定用户 1～4 永久使用 offckb #6～#9，LSP / Public T 使用 #5。用户编号与钱包不随通道轮次变化；SDK 身份和出资钱包是独立密钥。每轮账户及其 tenant_id 永久归属创建它的用户。
+固定账户 1～4 永久使用 offckb #6～#9，CLI 通过 `-u N` 操作，LSP / Public T 使用 #5。账户编号与钱包不随通道轮次变化；SDK 身份和出资钱包是独立密钥。每轮内部身份及其 tenant_id 永久归属创建它的账户。当前 SDK/服务端仍限制每租户一条通道，因此新轮次继续创建独立身份和租户，固定账户作为长期操作和历史管理单位。
 
 ```bash
 ./lsp-cli admin init-lsp
@@ -10,6 +10,7 @@
 ./lsp-cli status -u 1
 ./lsp-cli close-channel -u 1
 ./lsp-cli accounts --history
+./lsp-cli status -u 1 --round 1
 ./lsp-cli create-channel -u 1
 ```
 
@@ -23,9 +24,11 @@
 
 `close-channel -u N` 继续使用 SDK 双 lane 最新结算余额，阻止未结算 TLC；链上关闭确认和双方退款核验完成后才归档。无通道不归档。归档只更新清单，保留目录、密钥和恢复资料；写清单失败时原关闭记录保留，重试关闭核验原结果后补归档。成功归档后用户空闲，重复关闭通过最近关闭账户核对原结果。下一次显式开通分配新身份和租户，旧租户始终属于原用户。归档不注销租户、不释放服务端名额。
 
-`accounts` 离线只读展示四用户和本地阶段，不要求配置、节点或 offckb 可用；`--history` 显示历轮和旧未绑定账户。本地 Ready 不代表实时可用，`status -u N` 再核对远端及链上；初始化未注册时 status 展示本地阶段而不注册，空闲时读取最近关闭摘要。查询不写回清单或 SDK。
+`accounts` 离线只读展示四用户和本地状态，不要求配置、节点或 offckb 可用；`--history` 显示历轮和旧未绑定账户。本地 Ready 不代表实时可用，`status -u N` 再核对远端及链上；初始化未注册时 status 展示本地状态而不注册，空闲时读取最近关闭摘要。查询不写回清单或 SDK。
 
-所有日常命令必须选择 `-u N`。status、close-channel、resume、payment-status、invoice-status、list-payments 支持互斥 `--account ID` 历史入口；pay、create-invoice、watch、create-channel 只处理用户当前轮次。历史入口使用该身份原凭证，不切换当前指针、不跨用户查 hash；当前轮次关闭必须用用户入口。
+所有日常命令必须选择固定账户 `-u N`。status、close-channel、resume、payment-status、invoice-status、list-payments 支持 `-u N --round R` 历史入口；pay、create-invoice、watch、create-channel 只处理当前轮次。轮次按清单内该账户身份的创建顺序从 1 编号，包括当前轮次；只有已归档轮次允许用 `--round`，当前轮次直接用 `-u N`。历史查询使用该轮原凭证和 signer，不切换当前指针、不跨账户查 hash；历史归档重试不影响已创建的新轮次。兼容旧数据的 `--account ID` 入口仍保留，与 `-u N`、`--round R` 互斥，旧未绑定身份继续用此入口。
+
+`accounts` 展示固定账户、钱包、tenant_id、本地状态和历史数，不展示内部时间戳 ID 或当前轮次。`accounts --history` 展示各账户轮次及状态；旧未绑定身份仍展示 ID 以便恢复。历史直接存储于 `.state/fiber-lsp-client/`，清单关联账户与历轮，沿用原身份目录和 v2 格式，无需搬迁已有数据。
 
 锁顺序为用户锁 → 短清单锁 → 账户锁，清单锁不跨 RPC。关闭核验后释放账户锁，保持用户锁，再按清单锁 → 账户锁归档。锁非阻塞，竞争明确报错；新开通另持全局开通锁，避免共享 LSP #5 cell 冲突。
 

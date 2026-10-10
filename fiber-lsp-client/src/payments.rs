@@ -1018,7 +1018,7 @@ fn reconcile(
 
 fn print_local(op: &Operation) {
     println!(
-        "方向：{}\nhash：{}\n金额：{} CKB\n通道：{}\n本地阶段：{:?}\n更新时间（Unix ms）：{}\n本地授权到期（Unix ms）：{}",
+        "方向：{}\nhash：{}\n金额：{} CKB\n通道：{}\n当前状态：{:?}\n更新时间（Unix ms）：{}\n本地授权到期（Unix ms）：{}",
         if op.inbound { "收款" } else { "付款" },
         op.hash,
         ckb(op.amount),

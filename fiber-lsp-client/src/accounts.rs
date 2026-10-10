@@ -170,7 +170,7 @@ pub fn archive(root: &Path, requested: Option<&str>) -> Result<String> {
 
 fn list_legacy(root: &Path) -> Result<()> {
     let registry = Registry::load(root)?;
-    println!("账户 ID\t状态\ttenant_id\t本地阶段（不代表远端状态）");
+    println!("账户 ID\t状态\ttenant_id\t当前状态");
     for entry in registry.accounts {
         let dir = path(root, &entry.id);
         let summary = (|| -> Result<(String, String)> {
@@ -184,6 +184,9 @@ fn list_legacy(root: &Path) -> Result<()> {
                 let channel: serde_json::Value =
                     serde_json::from_slice(&read_private(&dir.join("channel.json"))?)?;
                 stage = channel["stage"].as_str().unwrap_or("未知").to_owned();
+            }
+            if stage == "identity_saved" {
+                stage = "unregistered".to_owned();
             }
             Ok((
                 account["tenant_id"]
@@ -420,6 +423,7 @@ pub struct Selection {
     pub id: String,
     pub user: Option<u8>,
     pub funding: Option<FundingBinding>,
+    historical: bool,
     _user_lock: Option<AccountDir>,
     _opening_lock: Option<AccountDir>,
 }
@@ -435,9 +439,14 @@ pub fn choose(
         "必须选择 -u N 或 --account ID，且两者互斥"
     );
     ensure!(
-        !current_only || options.user.is_some(),
+        !current_only || (options.user.is_some() && options.round.is_none()),
         "本命令只允许 -u N 当前账户"
     );
+    ensure!(
+        options.round.is_none() || (options.user.is_some() && !create),
+        "历史轮次必须使用 -u N，且不能用于新开通"
+    );
+    ensure!(options.round != Some(0), "轮次必须从 1 开始");
     let user_lock = options
         .user
         .map(|u| AccountDir::lock(&base(root).join(format!(".user-{u}"))))
@@ -473,16 +482,29 @@ pub fn choose(
             registry.save(root)?;
         }
         let user = registry.users.iter().find(|u| u.number == number).unwrap();
-        let id = user
-            .current_account
-            .as_ref()
-            .or_else(|| {
-                last_closed
-                    .then_some(user.last_closed_account.as_ref())
-                    .flatten()
-            })
-            .context("用户空闲，无当前账户；历史恢复请用 accounts --history 和 --account ID")?
-            .clone();
+        let id = if let Some(round) = options.round {
+            let entry = registry
+                .accounts
+                .iter()
+                .filter(|e| e.user == Some(number))
+                .nth((round - 1) as usize)
+                .context("未知历史轮次；请执行 accounts --history")?;
+            ensure!(
+                entry.archived,
+                "该轮次仍在使用；请直接使用 -u N 操作当前轮次"
+            );
+            entry.id.clone()
+        } else {
+            user.current_account
+                .as_ref()
+                .or_else(|| {
+                    last_closed
+                        .then_some(user.last_closed_account.as_ref())
+                        .flatten()
+                })
+                .context("账户空闲，无当前轮次；历史恢复请用 accounts --history 和 -u N --round R")?
+                .clone()
+        };
         (id, Some(number), Some(user.funding.clone()))
     } else {
         let id = options.account.as_ref().unwrap().clone();
@@ -512,10 +534,14 @@ pub fn choose(
         Some(dir) => dir,
         None => AccountDir::lock(&account_path)?,
     };
-    println!(
-        "用户：{}\n账户 ID：{id}",
-        owner.map_or_else(|| "旧账户未绑定".into(), |u| u.to_string())
-    );
+    if let Some(number) = owner {
+        println!("账户：{number}");
+        if let Some(round) = options.round {
+            println!("历史轮次：{round}");
+        }
+    } else {
+        println!("旧身份未绑定：{id}");
+    }
     if let Some(binding) = &funding {
         println!("出资钱包：offckb #{}", binding.offckb_index);
     }
@@ -525,6 +551,7 @@ pub fn choose(
             id,
             user: owner,
             funding,
+            historical: options.account.is_some() || options.round.is_some(),
             _user_lock: user_lock,
             _opening_lock: opening_lock,
         },
@@ -532,7 +559,7 @@ pub fn choose(
 }
 
 pub fn check_historical_close(root: &Path, selection: &Selection) -> Result<()> {
-    if selection._user_lock.is_none()
+    if selection.historical
         && let Some(registry) = UsersRegistry::load(root)?
     {
         ensure!(
@@ -580,7 +607,7 @@ fn archive_with_write(
             .context("归档账户不存在")?;
         ensure!(entry.user == selection.user, "账户永久归属发生变化");
         entry.archived = true;
-        if selection._user_lock.is_some() {
+        if !selection.historical {
             let user = registry
                 .users
                 .iter_mut()
@@ -624,7 +651,7 @@ fn archive_with_write(
             &serde_json::to_vec_pretty(&registry)?,
         )?;
     }
-    println!("账户 {} 已归档；身份、租户归属及历史保留", selection.id);
+    println!("本轮已归档；固定账户、身份、租户归属及历史保留");
     Ok(())
 }
 
@@ -720,7 +747,7 @@ pub fn list(root: &Path, history: bool) -> Result<()> {
         }
         return Ok(());
     };
-    println!("用户\toffckb\t当前账户\ttenant_id\t本地阶段\t历史数");
+    println!("账户\toffckb\ttenant_id\t当前状态\t历史数");
     for user in &registry.users {
         let (tenant, stage) = user
             .current_account
@@ -728,10 +755,9 @@ pub fn list(root: &Path, history: bool) -> Result<()> {
             .map(|id| summary(&path(root, id)))
             .unwrap_or_else(|| ("无当前租户".into(), "空闲（最近一轮已关闭）".into()));
         println!(
-            "{}\t#{}\t{}\t{tenant}\t{stage}\t{}",
+            "{}\t#{}\t{tenant}\t{stage}\t{}",
             user.number,
             user.funding.offckb_index,
-            user.current_account.as_deref().unwrap_or("无"),
             registry
                 .accounts
                 .iter()
@@ -740,16 +766,24 @@ pub fn list(root: &Path, history: bool) -> Result<()> {
         );
     }
     if history {
-        println!("账户 ID\t用户\t归档\ttenant_id\t本地阶段");
+        println!("账户\t轮次\t状态\ttenant_id\t当前状态");
+        let mut rounds = [0; 4];
         for entry in &registry.accounts {
             let (tenant, stage) = summary(&path(root, &entry.id));
+            let round = if let Some(number) = entry.user {
+                let count = &mut rounds[usize::from(number) - 1];
+                *count += 1;
+                count.to_string()
+            } else {
+                entry.id.clone()
+            };
             println!(
                 "{}\t{}\t{}\t{tenant}\t{stage}",
-                entry.id,
                 entry
                     .user
-                    .map_or_else(|| "旧账户未绑定".into(), |u| u.to_string()),
-                entry.archived
+                    .map_or_else(|| "旧身份未绑定".into(), |u| u.to_string()),
+                round,
+                if entry.archived { "历史" } else { "当前" }
             );
         }
     }
@@ -759,13 +793,16 @@ fn summary(dir: &Path) -> (String, String) {
     let read = || -> Result<(String, String)> {
         let value: serde_json::Value =
             serde_json::from_slice(&read_private(&dir.join("account.json"))?)?;
-        let stage = if dir.join("channel.json").try_exists()? {
+        let mut stage = if dir.join("channel.json").try_exists()? {
             let channel: serde_json::Value =
                 serde_json::from_slice(&read_private(&dir.join("channel.json"))?)?;
             channel["stage"].as_str().unwrap_or("未知").to_owned()
         } else {
             value["registration"].as_str().unwrap_or("未知").to_owned()
         };
+        if stage == "identity_saved" {
+            stage = "unregistered".to_owned();
+        }
         Ok((
             value["tenant_id"].as_str().unwrap_or("未知").to_owned(),
             stage,
@@ -821,6 +858,7 @@ mod user_tests {
     fn options(user: Option<u8>, account: Option<String>) -> crate::ClientOptions {
         crate::ClientOptions {
             selector: crate::Selector { user, account },
+            round: None,
             config: None,
         }
     }
@@ -976,6 +1014,36 @@ mod user_tests {
                 .all(|e| e.user == Some(1))
         );
         assert_eq!(next.funding.as_ref().unwrap().offckb_index, 6);
+        let next_id = next.id.clone();
+        drop(dir);
+        drop(next);
+        let before = fs::read(base(temp.path()).join("accounts.json")).unwrap();
+        let mut historical = options(Some(1), None);
+        historical.round = Some(1);
+        let (dir, old) = choose(temp.path(), &historical, false, false, false).unwrap();
+        assert_eq!(old.id, id);
+        assert!(check_historical_close(temp.path(), &old).is_ok());
+        assert!(choose(temp.path(), &options(Some(1), None), false, false, false).is_err());
+        assert!(choose(temp.path(), &historical, true, false, true).is_err());
+        drop(dir);
+        archive_verified(temp.path(), &old, channel, &hash).unwrap();
+        assert_eq!(
+            fs::read(base(temp.path()).join("accounts.json")).unwrap(),
+            before
+        );
+        drop(old);
+        historical.round = Some(2);
+        assert!(choose(temp.path(), &historical, false, false, false).is_err());
+        historical.round = Some(3);
+        assert!(choose(temp.path(), &historical, false, false, false).is_err());
+        historical.round = Some(0);
+        assert!(choose(temp.path(), &historical, false, false, false).is_err());
+        let (_, current) =
+            choose(temp.path(), &options(Some(1), None), false, false, false).unwrap();
+        assert_eq!(current.id, next_id);
+        let mut other = options(Some(2), None);
+        other.round = Some(1);
+        assert!(choose(temp.path(), &other, false, false, false).is_err());
     }
     #[tokio::test]
     async fn complete_account_directory_loss_or_owner_transfer_is_rejected() {

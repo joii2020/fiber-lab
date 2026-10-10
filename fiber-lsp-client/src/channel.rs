@@ -48,11 +48,15 @@ pub struct OpenOptions {
 pub struct CloseOptions {
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
-    /// accounts --history 列出的历史账户 ID
+    /// 兼容旧数据的内部身份 ID；日常历史操作使用 -u N --round R
     #[arg(long, value_name = "ID")]
     pub account: Option<String>,
+    /// 固定账户编号 1～4
     #[arg(short = 'u', long, value_parser = clap::value_parser!(u8).range(1..=4), conflicts_with = "account")]
     pub user: Option<u8>,
+    /// 选择固定账户的历史轮次（accounts --history 展示）
+    #[arg(long, value_name = "R", value_parser = clap::value_parser!(u32).range(1..), requires = "user", conflicts_with = "account")]
+    pub round: Option<u32>,
     #[arg(long)]
     pub channel_id: Option<Hash256>,
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
@@ -220,6 +224,7 @@ pub async fn open(options: OpenOptions) -> Result<()> {
             account: options.account.clone(),
         },
         config: options.config.clone(),
+        round: None,
     };
     client.current_only()?;
     let config = Config::load(options.config.as_deref())?;
@@ -671,6 +676,7 @@ pub async fn close(options: CloseOptions) -> Result<()> {
             account: options.account.clone(),
         },
         config: options.config.clone(),
+        round: options.round,
     };
     let config = Config::load(options.config.as_deref())?;
     let (dir, selection) = crate::accounts::choose(&config.root, &client, false, true, false)?;
@@ -1103,7 +1109,7 @@ pub async fn print_details(account: &ClientAccount, channels: &[Channel]) -> Res
         }
     }
     if let Some(intent) = intent {
-        println!("  本地阶段：{:?}", intent.stage);
+        println!("  当前状态：{:?}", intent.stage);
         if !matches!(intent.stage, Stage::Ready | Stage::Closed) {
             println!(
                 "  待恢复：./lsp-cli {} {}",
@@ -1889,6 +1895,7 @@ mod tests {
         let options = CloseOptions {
             account: None,
             user: None,
+            round: None,
             config: None,
             channel_id: Some(Hash256([9; 32])),
             timeout: 1,

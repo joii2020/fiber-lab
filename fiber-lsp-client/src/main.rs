@@ -45,7 +45,7 @@ enum Command {
     InvoiceStatus(payments::HashOptions),
     /// 只读列出本地收付款记录
     ListPayments(ClientOptions),
-    /// 离线列出四用户；--history 同时显示历轮及旧账户
+    /// 离线列出四个固定账户；--history 同时显示各账户历轮及旧身份
     Accounts {
         #[arg(long)]
         history: bool,
@@ -55,10 +55,10 @@ enum Command {
 #[derive(Args)]
 #[group(required = true, multiple = false)]
 struct Selector {
-    /// 固定用户编号 1～4
+    /// 固定账户编号 1～4
     #[arg(short = 'u', long, value_parser = clap::value_parser!(u8).range(1..=4))]
     user: Option<u8>,
-    /// accounts --history 中的历史账户 ID
+    /// 兼容旧数据的内部身份 ID；日常历史操作使用 -u N --round R
     #[arg(long, value_name = "ID")]
     account: Option<String>,
 }
@@ -67,6 +67,9 @@ struct Selector {
 struct ClientOptions {
     #[command(flatten)]
     selector: Selector,
+    /// 选择固定账户的历史轮次（accounts --history 展示）
+    #[arg(long, value_name = "R", value_parser = clap::value_parser!(u32).range(1..), requires = "user", conflicts_with = "account")]
+    round: Option<u32>,
     /// Node3 配置路径
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -80,15 +83,18 @@ impl std::ops::Deref for ClientOptions {
 impl ClientOptions {
     fn current_only(&self) -> Result<()> {
         ensure!(
-            self.user.is_some(),
-            "本命令必须使用 -u N；--account 仅用于历史查询和恢复"
+            self.user.is_some() && self.round.is_none(),
+            "本命令必须使用 -u N 当前轮次；--round 和 --account 仅用于历史查询和恢复"
         );
         Ok(())
     }
     fn recovery_selector(&self) -> String {
         self.user.map_or_else(
             || format!("--account {}", self.account.as_deref().unwrap()),
-            |u| format!("-u {u}"),
+            |u| {
+                self.round
+                    .map_or_else(|| format!("-u {u}"), |r| format!("-u {u} --round {r}"))
+            },
         )
     }
 }
@@ -218,5 +224,29 @@ mod tests {
             panic!()
         };
         assert!(options.funding_amount.is_none());
+    }
+    #[test]
+    fn historical_round_requires_fixed_account_and_recovery_preserves_round() {
+        for command in ["status", "close-channel", "list-payments"] {
+            assert!(Cli::try_parse_from(["lsp-cli", command, "--round", "1"]).is_err());
+            assert!(Cli::try_parse_from(["lsp-cli", command, "-u", "1", "--round", "0"]).is_err());
+            assert!(
+                Cli::try_parse_from(["lsp-cli", command, "--account", "default", "--round", "1"])
+                    .is_err()
+            );
+            assert!(Cli::try_parse_from(["lsp-cli", command, "-u", "1", "--round", "1"]).is_ok());
+        }
+        assert!(
+            Cli::try_parse_from(["lsp-cli", "create-channel", "-u", "1", "--round", "1"]).is_err()
+        );
+        let Some(Command::Status(options)) =
+            Cli::try_parse_from(["lsp-cli", "status", "-u", "2", "--round", "3"])
+                .unwrap()
+                .command
+        else {
+            panic!()
+        };
+        assert_eq!(options.recovery_selector(), "-u 2 --round 3");
+        assert!(options.current_only().is_err());
     }
 }

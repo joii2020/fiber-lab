@@ -106,7 +106,9 @@ curl --noproxy '*' -fsS http://127.0.0.1:21716 \
 ./lsp-cli status -u 1
 ```
 
-用户 1～4 永久绑定 offckb #6～#9；LSP / Public T 使用 #5。初始化创建四份独立 SDK 身份，尚不注册租户。重复初始化复用身份、钱包、当前轮次及历史，已关闭的空闲用户不会自动创建下一轮。旧 v1 账户保留原目录和密钥，迁移后标为“旧账户未绑定”，不会自动归给用户 1。
+固定账户 1～4 永久绑定 offckb #6～#9，通过 `-u N` 操作；LSP / Public T 使用 #5。初始化创建四份独立 SDK 身份，尚不注册租户。每个账户内部按轮次保留身份、租户和历史，`accounts` 展示固定账户及本地状态，不显示当前轮次，`accounts --history` 展示各账户历轮；日常操作无需使用内部 `account-…` ID。重复初始化复用身份、钱包、当前轮次及历史，已关闭的空闲账户不会自动创建下一轮。旧 v1 身份保留原目录和密钥，迁移后标为“旧身份未绑定”，不会自动归给账户 1。
+
+`accounts` 和 `accounts --history` 将仅创建本地身份、尚未注册 LSP 的账户本地状态显示为 `unregistered`。
 
 注册与开通合并为一个命令：
 
@@ -127,17 +129,17 @@ curl --noproxy '*' -fsS http://127.0.0.1:21716 \
 ```bash
 ./lsp-cli create-channel -u 1       # 恢复原开通，无需再填金额
 ./lsp-cli close-channel -u 1        # 恢复关闭；资金已关闭但归档失败时也重试此命令
-./lsp-cli status --account <旧账户ID>
-./lsp-cli close-channel --account <旧账户ID>
+./lsp-cli status -u 1 --round 1    # 查询账户 1 的历史第 1 轮
+./lsp-cli close-channel -u 1 --round 1  # 核对历史关闭结果
 ```
 
-日常操作必须显式选择 `-u N`，没有默认用户。`--account ID` 与用户参数互斥，仅允许 status、close-channel、resume、payment-status、invoice-status、list-payments 的历史入口，不切换用户当前轮次。用户当前轮次必须通过 `-u N` 关闭；历史入口不能绕过用户锁。无通道关闭不归档，未结算 TLC、退款校验失败或链上未确认也不归档。同用户命令互斥，新开通另有全局锁，四用户链上开通串行。
+日常操作必须显式选择固定账户 `-u N`。status、close-channel、resume、payment-status、invoice-status、list-payments 可加 `--round R` 选择该账户的历史轮次；轮次从 1 开始，按清单内创建顺序编号，包括当前轮次，只有已归档轮次允许通过历史入口操作。历史选择不切换当前轮次，并持有同一账户锁。当前轮次直接用 `-u N`；pay、create-invoice、watch、create-channel 不允许选择历史轮次。兼容旧数据的 `--account ID` 入口仍保留，与 `-u N`、`--round R` 互斥。无通道关闭不归档，未结算 TLC、退款校验失败或链上未确认也不归档。同账户命令互斥，新开通另有全局锁，四账户链上开通串行。
 
-保留 `.state/fiber-lsp-client/accounts.json` 及完整账户目录，包含 root-key、signer.bin、account.json、channel.json、payments.json；归档不移动或删除这些文件，也不注销服务端租户。清单结构损坏拒绝继续；单账户摘要异常在列表单独显示。详情见 [客户端账户](docs/client-account.md)。
+历史直接保留在 `.state/fiber-lsp-client/` 下，通过清单关联固定账户与各轮内部身份；沿用已有目录，无需迁移。保留 `accounts.json` 及完整身份目录，包含 root-key、signer.bin、account.json、channel.json、payments.json；归档不移动或删除这些文件，也不注销服务端租户。清单结构损坏拒绝继续；单账户摘要异常在列表单独显示。详情见 [客户端账户](docs/client-account.md)。
 
 ### 7. 收付款及离线恢复
 
-当前多用户开关及退款已通过真实 devnet 验证；完整收付款验收尚未通过。实际在线付款在 TLC 移除时缺少提前 preimage 证据，随后服务端 peer ACK 超时强关；必要前置见 [验证记录与草案](plans/draft-payment-resolution-prerequisite.md)。以下为已实现命令及目标流程。
+当前多用户开关及退款已通过真实 devnet 验证；完整收付款验收尚未通过。实际在线付款在 TLC 移除时缺少提前 preimage 证据，随后服务端 peer ACK 超时强关；历史验证记录与前置草案可通过 Git 查询。以下为已实现命令及目标流程。
 
 先准备普通节点与 LSP 的通道及对应方向流动性，再复用第 6 节已绑定的私有通道；命令不会自动连接节点、开通道或调整出资。默认 LSP 注入 99 CKB 时收款流动性为 0，建议客户端先付出 1 CKB，再由普通节点付回 1 CKB。
 
@@ -164,7 +166,7 @@ curl --noproxy '*' -fsS http://127.0.0.1:21716 \
 
 `Success` / `Paid` 是远端证据；只有 SDK 双 commitment lane 的 TLC 移除及余额核对完成才报告付款 / 收款完成。发送响应丢失时保留“结果未知”，恢复只查原 hash，不自动再次发送。收款秘密在本地保存，仅通过 SDK 完整恢复证明、链上 live funding 和恢复窗口检查后释放。查询不签名、释放秘密或发送付款；普通用户查询可能唤醒租户，不能查询管理侧 delivery 或保证看到 `Deferred`。
 
-CLI 退出只是客户端停止签名，不保证 LSP 私有通道离线，也不承诺长期离线期间最终到账。LSP 暂存付款需要 LSP 持续运行；真实通道离线通过显式管理操作构造。账户锁使同账户一次仅能运行一个命令，`watch` / `--wait` 在线时需先停止它再查询。实际离线、超时及重启场景的验收状态见 [方案索引](PLAN.md)。
+CLI 退出只是客户端停止签名，不保证 LSP 私有通道离线，也不承诺长期离线期间最终到账。LSP 暂存付款需要 LSP 持续运行；真实通道离线通过显式管理操作构造。账户锁使同账户一次仅能运行一个命令，`watch` / `--wait` 在线时需先停止它再查询。实际离线、超时及重启场景尚未通过验收，历史记录可通过 Git 查询。
 
 ### 8. 停止和重启
 

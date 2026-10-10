@@ -54,4 +54,4 @@ offckb accounts
 
 账户恢复规则见 [客户端账户](client-account.md)，节点和凭证的保存位置见 [运行数据](devnet.md#运行数据)。
 
-2026-10-09 真实收付款验证发现：客户端 get_payment 尚为 Inflight 且无 preimage 时，移除 TLC 签名被 SDK 拒绝；服务端一般 peer ACK 超时还可能强关通道。此时保留原 hash、账户目录与用户指针，查询实际链上状态，不将远端 Closed 当作已核验协作退款或通过归档/新付款绕过。必要服务端前置尚待确认，详细证据见 [前置草案](../plans/draft-payment-resolution-prerequisite.md)。
+2026-10-09 真实收付款验证发现：客户端 get_payment 尚为 Inflight 且无 preimage 时，移除 TLC 签名被 SDK 拒绝；服务端一般 peer ACK 超时还可能强关通道。此时保留原 hash、账户目录与用户指针，查询实际链上状态，不将远端 Closed 当作已核验协作退款或通过归档/新付款绕过。必要服务端前置尚待确认，历史前置草案与详细证据可通过 Git 查询。
