@@ -20,8 +20,9 @@ use fiber_types::{CkbInvoice, Currency, HashAlgorithm};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
+    collections::{HashMap, HashSet},
     io::Write,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const MAX_TLC_MS: u64 = 14 * 24 * 60 * 60 * 1000;
@@ -117,6 +118,10 @@ struct Operation {
     cancellation_started: bool,
     phase: Phase,
     remote_status: Option<String>,
+    #[serde(default)]
+    remote_error: Option<String>,
+    #[serde(default)]
+    latest_progress: Option<String>,
     updated_at_ms: u64,
     // Latest versions before the operation. A successful result requires both
     // lanes to have accepted and removed this exact authorized TLC afterwards.
@@ -272,17 +277,26 @@ async fn register(account: &ClientAccount, op: &Operation) -> Result<()> {
     Ok(())
 }
 async fn ready_channel(account: &ClientAccount, rpc: &Rpc, id: Hash256) -> Result<Channel> {
-    let channels = rpc.list_channels(token(account)?).await?;
+    let channels: fiber_json_types::ListChannelsResult = rpc
+        .call(
+            "list_channels",
+            json!([{ "include_closed": true }]),
+            token(account)?,
+        )
+        .await?;
     let channel = channels
         .channels
         .into_iter()
         .find(|c| c.channel_id == id)
         .context("远端无当前已绑定通道")?;
     ensure!(
-        channel.state == ChannelState::ChannelReady
-            && !channel.is_public
-            && channel.pubkey == account.lsp_public_key,
-        "通道尚不可收付款或归属不一致"
+        !channel.is_public && channel.pubkey == account.lsp_public_key,
+        "收付款通道归属不一致"
+    );
+    ensure!(
+        channel.state == ChannelState::ChannelReady,
+        "通道不可收付款：远端状态 {:?}；保留原付款和恢复资料",
+        channel.state
     );
     Ok(channel)
 }
@@ -348,6 +362,8 @@ pub async fn pay(options: PayOptions) -> Result<()> {
             cancellation_started: false,
             phase: Phase::IntentSaved,
             remote_status: None,
+            remote_error: None,
+            latest_progress: None,
             updated_at_ms: now_ms()?,
             start_versions: versions(&records),
         };
@@ -415,6 +431,8 @@ pub async fn create_invoice(options: InvoiceOptions) -> Result<()> {
         cancellation_started: false,
         phase: Phase::IntentSaved,
         remote_status: None,
+        remote_error: None,
+        latest_progress: None,
         updated_at_ms: created,
         start_versions: versions(&records),
     });
@@ -615,6 +633,12 @@ async fn wait(
         _ = deadline => { println!("本次等待超时；网络操作未取消，结果需继续核对。"); Ok(()) },
     };
     if let Some(hash) = target {
+        let op = &book.operations[book.index(hash)?];
+        if op.phase != Phase::Complete
+            && let Some(progress) = &op.latest_progress
+        {
+            println!("最后核对的进度（可能已变化）：\n{progress}");
+        }
         recovery(account, hash, options);
     } else {
         println!("再次执行 ./lsp-cli watch 或按原 hash resume。");
@@ -683,6 +707,48 @@ async fn send_once(account: &ClientAccount, rpc: &Rpc, book: &mut Book, i: usize
     Ok(())
 }
 
+async fn delivery_progress(
+    account: &ClientAccount,
+    rpc: &Rpc,
+    hash: Hash256,
+) -> Result<Option<fiber_json_types::PaymentDeliveryProgress>> {
+    let response: fiber_json_types::GetPaymentDeliveryResult = rpc
+        .call(
+            "get_payment_delivery",
+            json!([{ "payment_hash": hash }]),
+            token(account)?,
+        )
+        .await?;
+    let result = response.delivery;
+    if let Some(progress) = &result {
+        ensure!(progress.payment_hash == hash, "LSP 投递查询 hash 不符");
+    }
+    Ok(result)
+}
+
+fn describe_delivery(progress: &fiber_json_types::PaymentDeliveryProgress) -> String {
+    use fiber_json_types::LspPaymentDeliveryStatus as Status;
+    let state = match progress.status {
+        Status::Deferred => "暂存，等待通道在线或重试；尚未最终失败",
+        Status::Dispatching => "正在转发",
+        Status::InFlight => "下游付款处理中；不代表收款方已收到 TLC",
+        Status::SettlingUpstream => "下游结果已确定，正在结算付款方 TLC",
+        Status::Succeeded => "投递成功",
+        Status::Failed => "投递已失败；发票本身未取消",
+    };
+    let mut result = format!(
+        "LSP 投递：{state}；尝试 {} 次；投递截止（Unix ms）：{}",
+        progress.attempt_count, progress.buffer_deadline
+    );
+    if let Some(error) = &progress.last_error {
+        result.push_str(&format!("\nLSP 最近错误：{error}"));
+    }
+    if let Some(error) = &progress.failure_reason {
+        result.push_str(&format!("\nLSP 失败原因：{error}"));
+    }
+    result
+}
+
 async fn drive(
     account: &mut ClientAccount,
     rpc: &Rpc,
@@ -712,10 +778,85 @@ async fn drive(
             send_once(account, rpc, book, i).await?;
         }
     }
+    let mut last_probe: Option<Instant> = None;
+    let mut displayed: HashMap<Hash256, (String, Instant)> = HashMap::new();
+    let mut failed_deliveries = HashSet::new();
     loop {
-        ready_channel(account, rpc, id).await?;
+        let channel = ready_channel(account, rpc, id).await?;
         for i in 0..book.operations.len() {
             refresh(account, rpc, book, i).await?;
+        }
+        // Poll diagnostics less frequently than signing. Print changes and a 15-second heartbeat.
+        if last_probe.is_none_or(|at| at.elapsed() >= Duration::from_secs(5)) {
+            for op in &mut book.operations {
+                if target.is_some_and(|hash| hash != op.hash) || op.phase == Phase::Complete {
+                    continue;
+                }
+                let delivery = match delivery_progress(account, rpc, op.hash).await {
+                    Ok(Some(progress)) => {
+                        if matches!(
+                            progress.status,
+                            fiber_json_types::LspPaymentDeliveryStatus::Failed
+                        ) {
+                            failed_deliveries.insert(op.hash);
+                        } else {
+                            failed_deliveries.remove(&op.hash);
+                        }
+                        describe_delivery(&progress)
+                    }
+                    Ok(None) => "LSP 尚无本账户可见投递记录；不能据此判断付款结果".into(),
+                    Err(error) => format!("LSP 投递进度未核对：{error:#}"),
+                };
+                let message = format!(
+                    "{}进度；hash：{}；本地：{:?}；远端：{}\n通道可用余额（本方 / LSP）：{} / {} CKB\n{}{}",
+                    if op.inbound { "收款" } else { "付款" },
+                    op.hash,
+                    op.phase,
+                    op.remote_status.as_deref().unwrap_or("未核对"),
+                    ckb(channel.local_balance),
+                    ckb(channel.remote_balance),
+                    delivery,
+                    op.remote_error
+                        .as_ref()
+                        .map_or(String::new(), |error| format!("\n付款最近错误：{error}"))
+                );
+                if displayed.get(&op.hash).is_none_or(|(previous, at)| {
+                    previous != &message || at.elapsed() >= Duration::from_secs(15)
+                }) {
+                    println!("{message}");
+                    if op.inbound
+                        && op.remote_status.as_deref() == Some("Open")
+                        && channel.received_tlc_balance == 0
+                        && channel.remote_balance < op.amount
+                    {
+                        println!(
+                            "入账流动性不足：LSP 一侧可用余额小于发票金额；仅恢复签名进程不能补充余额。"
+                        );
+                    }
+                    displayed.insert(op.hash, (message.clone(), Instant::now()));
+                }
+                op.latest_progress = Some(message);
+            }
+            book.save(&account.dir)?;
+            last_probe = Some(Instant::now());
+        }
+        if let Some(hash) = target {
+            let op = &book.operations[book.index(hash)?];
+            if failed_deliveries.contains(&hash)
+                && !matches!(
+                    op.remote_status.as_deref(),
+                    Some("Paid" | "Success" | "Cancelled" | "Failed")
+                )
+            {
+                bail!(
+                    "本次 LSP 投递已失败；hash：{hash}；{}。详情见上方进度",
+                    if op.inbound {
+                        "发票未取消，不能据此认定其他付款失败"
+                    } else {
+                        "付款 RPC 尚未报告最终失败，TLC 清理和余额仍待核对；未取消网络付款"
+                    }
+                );
+            }
         }
         sign(account, rpc, book, id).await?;
         for i in 0..book.operations.len() {
@@ -753,7 +894,12 @@ async fn drive(
                 bail!("发票已过期且当前无入账 TLC；hash：{hash}，上游结果和余额仍需核对");
             }
             if op.phase == Phase::Failed {
-                bail!("原操作已失败（TLC 清理已核对）；hash：{hash}，不自动再次发送");
+                bail!(
+                    "原操作已失败（TLC 清理已核对）；hash：{hash}；原因：{}；不自动再次发送",
+                    op.remote_error
+                        .as_deref()
+                        .unwrap_or("远端未提供，见投递进度")
+                );
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -799,6 +945,7 @@ async fn refresh(account: &ClientAccount, rpc: &Rpc, book: &mut Book, i: usize) 
             "付款查询 hash 或费用不符"
         );
         op.remote_status = Some(format!("{:?}", remote.status));
+        op.remote_error = remote.failed_error.clone();
         if let Some(preimage) = remote.payment_preimage {
             ensure!(
                 op.authorization.hash_algorithm.hash(preimage.0) == op.hash.0,
@@ -1034,6 +1181,14 @@ fn print_local(op: &Operation) {
         "最近推进时的远端状态：{}",
         op.remote_status.as_deref().unwrap_or("未核对")
     );
+    if let Some(error) = &op.remote_error {
+        println!("最近付款错误：{error}");
+    }
+    if op.phase != Phase::Complete
+        && let Some(progress) = &op.latest_progress
+    {
+        println!("最近保存的进度（可能已变化）：\n{progress}");
+    }
     if op.phase == Phase::RemoteSuccess {
         println!("远端成功，待本地核对");
     }
@@ -1053,18 +1208,41 @@ pub async fn status(options: HashOptions, inbound: bool) -> Result<()> {
     let rpc = Rpc::new(&config.rpc_url)?;
     let result = async {
         if inbound {
-            let result = lookup_invoice(&account, &rpc, op.hash).await?.context("远端发票不存在")?;
+            let result = lookup_invoice(&account, &rpc, op.hash)
+                .await?
+                .context("远端发票不存在")?;
             validate_created(&account, op, &result.invoice_address, &result.invoice)?;
-            println!("本次远端原始状态：{:?}\n发票到期（Unix ms）：{}", result.status, invoice_deadline(&invoice(&result.invoice_address)?)?);
-            println!("delivery：用户接口不可用；未查询管理数据，不能推断是否已收到付款。查询可能唤醒租户。");
+            println!(
+                "本次远端原始状态：{:?}\n发票到期（Unix ms）：{}",
+                result.status,
+                invoice_deadline(&invoice(&result.invoice_address)?)?
+            );
+            println!("查询可能唤醒租户；投递进度只读，不签名或结算。");
         } else {
-            let result = lookup_payment(&account, &rpc, op.hash).await?.context("远端付款不存在，原发送结果需核对")?;
-            ensure!(result.payment_hash == op.hash && result.fee <= u128::from(op.max_fee), "远端付款 hash 或费用不匹配");
-            println!("本次远端原始状态：{:?}\n远端费用：{} CKB", result.status, ckb(result.fee));
-            if result.failed_error.is_some() { println!("远端报告失败；具体原因请在节点日志核对。"); }
+            let result = lookup_payment(&account, &rpc, op.hash)
+                .await?
+                .context("远端付款不存在，原发送结果需核对")?;
+            ensure!(
+                result.payment_hash == op.hash && result.fee <= u128::from(op.max_fee),
+                "远端付款 hash 或费用不匹配"
+            );
+            println!(
+                "本次远端原始状态：{:?}\n远端费用：{} CKB",
+                result.status,
+                ckb(result.fee)
+            );
+            if let Some(error) = result.failed_error {
+                println!("付款最近错误（不单独代表最终失败）：{error}");
+            }
+        }
+        match delivery_progress(&account, &rpc, op.hash).await {
+            Ok(Some(progress)) => println!("{}", describe_delivery(&progress)),
+            Ok(None) => println!("LSP 尚无本账户可见投递记录；不能据此判断付款结果"),
+            Err(error) => println!("LSP 投递进度未核对：{error:#}"),
         }
         Ok::<_, anyhow::Error>(())
-    }.await;
+    }
+    .await;
     println!("查询时间（Unix ms）：{}", now_ms()?);
     if let Err(e) = result {
         println!("远端未核对：{e:#}");
@@ -1094,6 +1272,74 @@ mod tests {
     };
     use fiber_types::Privkey;
     use std::{fs, os::unix::fs::PermissionsExt};
+
+    #[tokio::test]
+    async fn delivery_query_checks_hash_and_never_mutates_local_authorization() {
+        let (_root, config, listener) = fixture();
+        let (account, book) = fixture_book(&config, true).await;
+        let hash = book.operations[0].hash;
+        let paths = ["payments.json", "signer.bin", "account.json"];
+        let before = paths.map(|path| fs::read(account.dir.path.join(path)).unwrap());
+        let mut progress = fiber_json_types::PaymentDeliveryProgress {
+            payment_hash: hash,
+            status: fiber_json_types::LspPaymentDeliveryStatus::Failed,
+            attempt_count: 2,
+            buffer_deadline: 123,
+            last_error: Some("Insufficient balance".into()),
+            failure_reason: Some("delivery expired".into()),
+        };
+        let valid = serde_json::to_value(&progress).unwrap();
+        progress.payment_hash = Hash256([9; 32]);
+        let server = serve(
+            listener,
+            vec![
+                ("get_payment_delivery", json!({"delivery": valid})),
+                ("get_payment_delivery", json!({"delivery": progress})),
+                ("get_payment_delivery", json!({"delivery": null})),
+            ],
+        );
+        let rpc = Rpc::new(&config.rpc_url).unwrap();
+        assert!(matches!(
+            delivery_progress(&account, &rpc, hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            fiber_json_types::LspPaymentDeliveryStatus::Failed
+        ));
+        assert!(delivery_progress(&account, &rpc, hash).await.is_err());
+        assert!(
+            delivery_progress(&account, &rpc, hash)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        server.join().unwrap();
+        for (path, content) in paths.into_iter().zip(before) {
+            assert_eq!(fs::read(account.dir.path.join(path)).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn delivery_feedback_distinguishes_retries_and_final_failure() {
+        let mut progress = fiber_json_types::PaymentDeliveryProgress {
+            payment_hash: Hash256([1; 32]),
+            status: fiber_json_types::LspPaymentDeliveryStatus::Deferred,
+            attempt_count: 2,
+            buffer_deadline: 123,
+            last_error: Some("Insufficient balance: available 0, required 100000000".into()),
+            failure_reason: None,
+        };
+        let message = describe_delivery(&progress);
+        assert!(message.contains("尚未最终失败"));
+        assert!(message.contains("Insufficient balance"));
+        progress.status = fiber_json_types::LspPaymentDeliveryStatus::Failed;
+        progress.failure_reason = Some("buffer deadline elapsed".into());
+        let message = describe_delivery(&progress);
+        assert!(message.contains("投递已失败"));
+        assert!(message.contains("发票本身未取消"));
+        assert!(message.contains("buffer deadline elapsed"));
+    }
 
     async fn operation(account: &mut ClientAccount, inbound: bool) -> Operation {
         // Bind a real SDK-derived channel key for the local record tests. Tests
@@ -1132,6 +1378,8 @@ mod tests {
             cancellation_started: false,
             phase: Phase::IntentSaved,
             remote_status: None,
+            remote_error: None,
+            latest_progress: None,
             updated_at_ms: now_ms().unwrap(),
             start_versions: [1, 1],
         }

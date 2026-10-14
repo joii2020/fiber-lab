@@ -22,6 +22,34 @@ pub const RESERVE: u64 = 99 * CKB;
 pub const CLIENT_FUNDING_ACCOUNT: usize = 6;
 const LSP_FUNDING_ACCOUNT: usize = 5;
 
+#[derive(Deserialize)]
+struct FiberConfig {
+    chain: String,
+    scripts: Vec<Contract>,
+    open_channel_auto_accept_min_ckb_funding_amount: Option<u64>,
+    auto_accept_channel_ckb_funding_amount: Option<u64>,
+}
+
+impl FiberConfig {
+    fn remote_funding_amount(&self) -> u64 {
+        // fnn reserves 99 CKB occupied capacity plus 1 CKB shutdown fee.
+        self.auto_accept_channel_ckb_funding_amount
+            .unwrap_or(RESERVE + CKB)
+    }
+}
+
+#[derive(Deserialize)]
+struct Contract {
+    name: String,
+    script: ckb_jsonrpc_types::Script,
+    cell_deps: Vec<Dep>,
+}
+
+#[derive(Deserialize)]
+struct Dep {
+    cell_dep: ckb_jsonrpc_types::CellDep,
+}
+
 fn legacy_wallet_account() -> usize {
     LSP_FUNDING_ACCOUNT
 }
@@ -76,31 +104,14 @@ impl Wallet {
             ckb: CkbConfig,
         }
         #[derive(Deserialize)]
-        struct FiberConfig {
-            chain: String,
-            scripts: Vec<Contract>,
-            open_channel_auto_accept_min_ckb_funding_amount: Option<u64>,
-            auto_accept_channel_ckb_funding_amount: Option<u64>,
-        }
-        #[derive(Deserialize)]
         struct CkbConfig {
             rpc_url: String,
-        }
-        #[derive(Deserialize)]
-        struct Contract {
-            name: String,
-            script: ckb_jsonrpc_types::Script,
-            cell_deps: Vec<Dep>,
-        }
-        #[derive(Deserialize)]
-        struct Dep {
-            cell_dep: ckb_jsonrpc_types::CellDep,
         }
         let path = config_path(config)?;
         let cfg: LocalConfig = serde_yaml::from_slice(&std::fs::read(&path)?)
             .map_err(|_| anyhow::anyhow!("Node3 配置缺少 ckb.rpc_url、fiber.chain 或合约部署"))?;
         let spec: toml::Value = toml::from_str(&std::fs::read_to_string(
-            path.parent().unwrap().join(cfg.fiber.chain),
+            path.parent().unwrap().join(&cfg.fiber.chain),
         )?)?;
         ensure!(
             spec.get("name").and_then(toml::Value::as_str) == Some("ckb_dev"),
@@ -149,6 +160,7 @@ impl Wallet {
         let dep = resolver
             .resolve(&wallet_lock.clone().into())
             .context("genesis 中无法解析默认 lock dep")?;
+        let remote_amount = cfg.fiber.remote_funding_amount();
         let terms = Terms {
             ckb_rpc_url: cfg.ckb.rpc_url,
             genesis_hash,
@@ -170,10 +182,7 @@ impl Wallet {
             wallet_lock,
             wallet_account: binding.offckb_index,
             remote_wallet_lock: Some(remote_wallet_lock),
-            remote_amount: cfg
-                .fiber
-                .auto_accept_channel_ckb_funding_amount
-                .unwrap_or(RESERVE),
+            remote_amount,
             auto_accept_min: cfg
                 .fiber
                 .open_channel_auto_accept_min_ckb_funding_amount
@@ -329,7 +338,9 @@ impl Wallet {
         );
         ensure!(
             result.opening_context.remote_amount == u128::from(self.terms.remote_amount),
-            "对方注入额超出本地条款"
+            "对方注入额与本地条款不一致：服务端 {} shannons，本地 {} shannons；原开通意图已保留",
+            result.opening_context.remote_amount,
+            self.terms.remote_amount
         );
         ensure!(
             &result.opening_context.remote_shutdown_script == self.terms.remote_wallet_lock(),
@@ -741,6 +752,23 @@ pub fn public_binding(index: usize) -> Result<crate::accounts::FundingBinding> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    fn omitted_funding_uses_fnn_default_and_explicit_values_are_preserved() {
+        let config: FiberConfig =
+            serde_yaml::from_str("chain: devnet.toml\nscripts: []\n").unwrap();
+        assert_eq!(config.remote_funding_amount(), 100 * CKB);
+        let config: FiberConfig = serde_yaml::from_str(
+            "chain: devnet.toml\nscripts: []\nauto_accept_channel_ckb_funding_amount: null\n",
+        )
+        .unwrap();
+        assert_eq!(config.remote_funding_amount(), 100 * CKB);
+        for amount in [0, 99 * CKB, 200 * CKB] {
+            let config: FiberConfig = serde_yaml::from_str(&format!(
+                "chain: devnet.toml\nscripts: []\nauto_accept_channel_ckb_funding_amount: {amount}\n"
+            )).unwrap();
+            assert_eq!(config.remote_funding_amount(), amount);
+        }
+    }
     pub fn terms() -> Terms {
         let key = secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
         let hash = ckb_hash::blake2b_256(key.public_key(secp256k1::SECP256K1).serialize());
