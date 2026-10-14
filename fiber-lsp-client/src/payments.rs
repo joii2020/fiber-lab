@@ -12,6 +12,7 @@ use fiber_json_types::{
     Channel, ChannelSigningStatus, ChannelSigningTransition, ChannelState, CkbInvoiceStatus,
     GetChannelSigningStatusResult, GetInvoiceResult, GetPaymentCommandResult, Hash256,
     InvoiceResult, NewInvoiceParams, PaymentStatus, SubmitChannelSignatureParams,
+    WaitChannelUpdateParams, WaitChannelUpdateResult,
 };
 use fiber_lsp_sdk::{
     PaymentAuthorization, ProcessOutcome, RecoveryRecord, SigningPolicy, SubmitParams,
@@ -766,6 +767,8 @@ async fn drive(
         }
     }
     let (id, wallet, local_reserve, remote_reserve) = channel::payment_context(account)?;
+    // Take the cursor before checking state so changes during this drive pass are retained.
+    let mut revision = wait_channel_update(account, rpc, id, None).await?;
     wallet.check_network().await?;
     for i in 0..book.operations.len() {
         ensure!(book.operations[i].channel_id == id, "收付款属于其他通道");
@@ -902,8 +905,29 @@ async fn drive(
                 );
             }
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        revision = wait_channel_update(account, rpc, id, Some(revision)).await?;
     }
+}
+async fn wait_channel_update(
+    account: &ClientAccount,
+    rpc: &Rpc,
+    id: Hash256,
+    after: Option<u64>,
+) -> Result<u64> {
+    let result: WaitChannelUpdateResult = rpc
+        .call(
+            "wait_channel_update",
+            json!([WaitChannelUpdateParams {
+                channel_id: id,
+                after,
+                timeout_ms: 5_000
+            }]),
+            token(account)?,
+        )
+        .await
+        .context("LSP 事件等待失败；请确认节点已升级，原付款和恢复资料保留")?;
+    ensure!(result.channel_id == id, "事件等待返回了其他通道");
+    Ok(result.revision)
 }
 async fn refresh(account: &ClientAccount, rpc: &Rpc, book: &mut Book, i: usize) -> Result<()> {
     let op = &mut book.operations[i];
@@ -1272,6 +1296,62 @@ mod tests {
     };
     use fiber_types::Privkey;
     use std::{fs, os::unix::fs::PermissionsExt};
+
+    #[tokio::test]
+    async fn event_wait_checks_channel_and_preserves_payment_authorization() {
+        let (_root, config, listener) = fixture();
+        let (account, book) = fixture_book(&config, true).await;
+        let id = book.operations[0].channel_id;
+        let before = fs::read(account.dir.path.join("payments.json")).unwrap();
+        let server = serve(
+            listener,
+            vec![
+                (
+                    "wait_channel_update",
+                    json!({ "channel_id": id, "revision": "0x1" }),
+                ),
+                (
+                    "wait_channel_update",
+                    json!({ "channel_id": id, "revision": "0x2" }),
+                ),
+                (
+                    "wait_channel_update",
+                    json!({ "channel_id": Hash256([9; 32]), "revision": "0x3" }),
+                ),
+                (
+                    "wait_channel_update",
+                    json!({ "error": {"code": -32601, "message": "Method not found"} }),
+                ),
+            ],
+        );
+        let rpc = Rpc::new(&config.rpc_url).unwrap();
+        assert_eq!(
+            wait_channel_update(&account, &rpc, id, None).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            wait_channel_update(&account, &rpc, id, Some(1))
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(
+            wait_channel_update(&account, &rpc, id, Some(2))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("其他通道")
+        );
+        let error = wait_channel_update(&account, &rpc, id, Some(2))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("节点已升级"));
+        assert_eq!(
+            fs::read(account.dir.path.join("payments.json")).unwrap(),
+            before
+        );
+        server.join().unwrap();
+    }
 
     #[tokio::test]
     async fn delivery_query_checks_hash_and_never_mutates_local_authorization() {
