@@ -1,6 +1,5 @@
 ## 基本规范
 - [Shell 脚本规范](AGENTS-Shell.md)
-- 方案规划遵循 [方案规划规范](AGENTS-Plan.md)。
 
 
 ## 开发约定
