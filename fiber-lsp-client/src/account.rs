@@ -115,6 +115,7 @@ impl ClientAccount {
     }
 
     pub async fn load_dir(config: &Config, dir: AccountDir) -> Result<Self> {
+        let _timing = crate::timings::Span::new("cli.account_restore");
         let id = dir.path.file_name().unwrap().to_string_lossy();
         let recovery = registration_recovery(config, &id)?;
         let (record, session) = restore(&dir, config).await?;

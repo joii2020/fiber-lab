@@ -78,7 +78,9 @@ impl AccountDir {
     }
 
     pub fn save_json<T: Serialize>(&self, value: &T) -> Result<()> {
+        let _timing = crate::timings::Span::new("store.account.serialize");
         let bytes = serde_json::to_vec_pretty(value).context("无法编码账户记录")?;
+        drop(_timing);
         atomic_write(&self.path.join("account.json"), &bytes)
     }
 }
@@ -121,6 +123,12 @@ pub fn read_private(path: &Path) -> Result<Vec<u8>> {
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let _write = crate::timings::Span::new(match path.file_name().and_then(|n| n.to_str()) {
+        Some("signer.bin") => "store.signer.write",
+        Some("payments.json") => "store.payments.write",
+        Some("account.json") => "store.account.write",
+        _ => "store.other.write",
+    });
     let parent = path.parent().context("账户文件缺少父目录")?;
     if path.try_exists()? {
         check_private_file(path)?;
@@ -131,12 +139,17 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .set_permissions(fs::Permissions::from_mode(0o600))?;
     temp.write_all(bytes)
         .with_context(|| format!("无法写入 {}", path.display()))?;
+    let file_sync = crate::timings::Span::new("store.file_fsync");
     temp.as_file()
         .sync_all()
         .with_context(|| format!("无法同步 {}", path.display()))?;
+    drop(file_sync);
+    let rename = crate::timings::Span::new("store.rename");
     temp.persist(path)
         .map_err(|error| error.error)
         .with_context(|| format!("无法原子替换 {}", path.display()))?;
+    drop(rename);
+    let _dir_sync = crate::timings::Span::new("store.directory_fsync");
     File::open(parent)?
         .sync_all()
         .with_context(|| format!("无法同步 {} 的目录", path.display()))?;
@@ -205,7 +218,9 @@ impl FileSignerStore {
             bail!("SDK 存储曾写入失败；请退出后重新核对账户文件");
         }
         // Mutate a separate SDK snapshot. Publish it in memory only after durable I/O.
+        let copy = crate::timings::Span::new("store.signer.snapshot_copy");
         let candidate = MemoryStore::from_snapshot(&state.memory.snapshot()?)?;
+        drop(copy);
         let changed = match change {
             Change::Insert(value) => candidate.insert_if_absent(key, value).await?,
             Change::Cas(expected, value) => {
@@ -227,7 +242,9 @@ impl FileSignerStore {
             }
         };
         if changed {
+            let serialize = crate::timings::Span::new("store.signer.serialize");
             let snapshot = candidate.snapshot()?;
+            drop(serialize);
             if let Err(error) = atomic_write(&self.path, &snapshot) {
                 state.write_failed = true;
                 return Err(error);

@@ -189,10 +189,10 @@ impl Book {
         Ok(book)
     }
     fn save(&self, dir: &AccountDir) -> Result<()> {
-        atomic_write(
-            &dir.path.join("payments.json"),
-            &serde_json::to_vec_pretty(self)?,
-        )
+        let serialize = crate::timings::Span::new("store.payments.serialize");
+        let bytes = serde_json::to_vec_pretty(self)?;
+        drop(serialize);
+        atomic_write(&dir.path.join("payments.json"), &bytes)
     }
     fn index(&self, hash: Hash256) -> Result<usize> {
         self.operations
@@ -303,6 +303,7 @@ async fn ready_channel(account: &ClientAccount, rpc: &Rpc, id: Hash256) -> Resul
 }
 
 pub async fn pay(options: PayOptions) -> Result<()> {
+    let _timing = crate::timings::Span::new("payment.pay");
     options.client.current_only()?;
     let config = Config::load(options.client.config.as_deref())?;
     let (dir, _selection) =
@@ -387,6 +388,7 @@ pub async fn pay(options: PayOptions) -> Result<()> {
 }
 
 pub async fn create_invoice(options: InvoiceOptions) -> Result<()> {
+    let _timing = crate::timings::Span::new("payment.invoice");
     options.client.current_only()?;
     let config = Config::load(options.client.config.as_deref())?;
     let (dir, _selection) =
@@ -676,6 +678,7 @@ fn payment_params(account: &ClientAccount, op: &Operation) -> Result<serde_json:
         "tlc_expiry_limit": format!("0x{MAX_TLC_MS:x}") }]))
 }
 async fn send_once(account: &ClientAccount, rpc: &Rpc, book: &mut Book, i: usize) -> Result<()> {
+    let _timing = crate::timings::Span::new("payment.send");
     let op = &book.operations[i];
     if op.send_started {
         return Ok(());
@@ -756,6 +759,7 @@ async fn drive(
     book: &mut Book,
     target: Option<Hash256>,
 ) -> Result<()> {
+    let _timing = crate::timings::Span::new("payment.drive");
     if let Some(hash) = target {
         let op = &book.operations[book.index(hash)?];
         if op.phase == Phase::Complete {
@@ -930,6 +934,7 @@ async fn wait_channel_update(
     Ok(result.revision)
 }
 async fn refresh(account: &ClientAccount, rpc: &Rpc, book: &mut Book, i: usize) -> Result<()> {
+    let _timing = crate::timings::Span::new("payment.refresh");
     let op = &mut book.operations[i];
     let signer = account.session.channel_signer(op.channel_id.into()).await?;
     if op.inbound {
@@ -1001,6 +1006,7 @@ async fn refresh(account: &ClientAccount, rpc: &Rpc, book: &mut Book, i: usize) 
     book.save(&account.dir)
 }
 async fn sign(account: &mut ClientAccount, rpc: &Rpc, book: &mut Book, id: Hash256) -> Result<()> {
+    let _timing = crate::timings::Span::new("payment.external_sign");
     let result: GetChannelSigningStatusResult = rpc
         .call(
             "get_channel_signing_status",
@@ -1050,6 +1056,7 @@ async fn sign(account: &mut ClientAccount, rpc: &Rpc, book: &mut Book, id: Hash2
         );
         saved.params.clone()
     } else {
+        let sdk = crate::timings::Span::new("payment.sdk_prepare_confirm");
         let now = now_ms()?;
         let outcome = account
             .session
@@ -1066,12 +1073,15 @@ async fn sign(account: &mut ClientAccount, rpc: &Rpc, book: &mut Book, id: Hash2
         let SubmitParams::Channel(params) = submit else {
             bail!("收付款不授权 watchtower 签名");
         };
+        drop(sdk);
+        let replay = crate::timings::Span::new("payment.replay_persist");
         account.save()?;
         book.pending_signature = Some(PendingSignature {
             status: result.status,
             params: params.clone(),
         });
         book.save(&account.dir)?;
+        drop(replay);
         params
     };
     let _: serde_json::Value = rpc
@@ -1086,6 +1096,7 @@ async fn release(
     i: usize,
     wallet: &Wallet,
 ) -> Result<()> {
+    let _timing = crate::timings::Span::new("payment.release");
     let op = &book.operations[i];
     if !op.inbound || op.cancellation_started || op.remote_status.as_deref() != Some("Received") {
         return Ok(());
@@ -1139,6 +1150,7 @@ fn reconcile(
     local_reserve: u64,
     remote_reserve: u64,
 ) -> Result<()> {
+    let _timing = crate::timings::Span::new("payment.reconcile");
     let successful =
         op.remote_status.as_deref() == Some(if op.inbound { "Paid" } else { "Success" });
     let failed =

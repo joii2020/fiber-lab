@@ -5,6 +5,7 @@ mod channel;
 mod payments;
 mod rpc;
 mod store;
+mod timings;
 mod wallet;
 
 use anyhow::{Result, ensure};
@@ -14,6 +15,9 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "./lsp-cli", about = "Fiber LSP 联调工具")]
 struct Cli {
+    /// 将分项计时 JSON 写入 stderr（不包含请求内容）
+    #[arg(long, global = true)]
+    timings: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -111,14 +115,20 @@ enum AdminCommand {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    if let Err(error) = run().await {
+    let cli = Cli::parse();
+    timings::enable(cli.timings);
+    let total = timings::Span::new("cli.total");
+    let result = run(cli).await;
+    drop(total);
+    timings::report(result.is_ok());
+    if let Err(error) = result {
         eprintln!("错误：{error:#}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<()> {
-    let Some(command) = Cli::parse().command else {
+async fn run(cli: Cli) -> Result<()> {
+    let Some(command) = cli.command else {
         Cli::command().print_help()?;
         println!();
         return Ok(());

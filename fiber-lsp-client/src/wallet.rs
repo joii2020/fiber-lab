@@ -89,7 +89,7 @@ pub struct Wallet {
 impl Wallet {
     pub fn from_terms(terms: Terms) -> Result<Self> {
         Ok(Self {
-            chain: Rpc::new(&terms.ckb_rpc_url)?,
+            chain: Rpc::chain(&terms.ckb_rpc_url)?,
             terms,
         })
     }
@@ -151,7 +151,7 @@ impl Wallet {
             wallet_lock != remote_wallet_lock,
             "客户端和 LSP 出资钱包必须不同"
         );
-        let chain = Rpc::new(&cfg.ckb.rpc_url)?;
+        let chain = Rpc::chain(&cfg.ckb.rpc_url)?;
         let genesis: ckb_jsonrpc_types::BlockView = chain
             .call("get_block_by_number", json!(["0x0"]), "")
             .await?;
@@ -704,6 +704,7 @@ impl fiber_lsp_sdk::ChainVerifier for Wallet {
         &self,
         point: &packed::OutPoint,
     ) -> std::result::Result<fiber_lsp_sdk::VerifiedCell, fiber_lsp_sdk::SignerError> {
+        let _timing = crate::timings::Span::new("payment.chain_check");
         let result = async {
             self.check_network().await?;
             let (output, data) = self.input_cell(point, true).await?;

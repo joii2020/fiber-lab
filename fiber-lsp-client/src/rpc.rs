@@ -108,6 +108,7 @@ impl Config {
 }
 
 pub struct Rpc {
+    service: &'static str,
     url: String,
     client: reqwest::Client,
     next_id: AtomicU64,
@@ -115,7 +116,16 @@ pub struct Rpc {
 
 impl Rpc {
     pub fn new(url: &str) -> Result<Self> {
+        Self::with_service(url, "lsp")
+    }
+
+    pub fn chain(url: &str) -> Result<Self> {
+        Self::with_service(url, "ckb")
+    }
+
+    fn with_service(url: &str, service: &'static str) -> Result<Self> {
         Ok(Self {
+            service,
             url: url.to_owned(),
             client: reqwest::Client::builder()
                 .no_proxy()
@@ -128,6 +138,18 @@ impl Rpc {
     }
 
     pub async fn call<R: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+        token: &str,
+    ) -> Result<R> {
+        let mut span = crate::timings::Span::rpc(self.service, method);
+        let result = self.call_inner(method, params, token).await;
+        span.finish(result.is_ok());
+        result
+    }
+
+    async fn call_inner<R: DeserializeOwned>(
         &self,
         method: &str,
         params: Value,
