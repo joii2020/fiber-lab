@@ -614,6 +614,47 @@ pub async fn watch(options: crate::ClientOptions) -> Result<()> {
     println!("前台推进本账户原授权；Ctrl-C 停止等待，保留发票与恢复资料。");
     wait(&mut account, &rpc, &mut book, None, None, &options).await
 }
+struct ReceiptTiming {
+    hash: Hash256,
+    waiting: Option<crate::timings::Span>,
+    processing: Option<crate::timings::Span>,
+}
+
+impl ReceiptTiming {
+    fn new(hash: Hash256) -> Self {
+        Self {
+            hash,
+            waiting: Some(crate::timings::Span::new("payment.wait_for_receipt")),
+            processing: None,
+        }
+    }
+
+    fn observe_tlc(&mut self, hash: Hash256, inbound: bool) {
+        if hash == self.hash && inbound && self.processing.is_none() {
+            drop(self.waiting.take());
+            self.processing = Some(crate::timings::Span::new("payment.receipt_processing"));
+        }
+    }
+
+    fn observe_status(&mut self, status: &ChannelSigningStatus) {
+        if let ChannelSigningStatus::SignatureRequired {
+            settlement: Some(settlement),
+            ..
+        } = status
+        {
+            for tlc in &settlement.tlcs {
+                self.observe_tlc(tlc.payment_hash, tlc.inbound);
+            }
+        }
+    }
+
+    fn finish(mut self, complete: bool) {
+        if let Some(processing) = &mut self.processing {
+            processing.finish(complete);
+        }
+    }
+}
+
 async fn wait(
     account: &mut ClientAccount,
     rpc: &Rpc,
@@ -622,7 +663,14 @@ async fn wait(
     timeout: Option<u64>,
     options: &crate::ClientOptions,
 ) -> Result<()> {
-    let future = drive(account, rpc, book, target);
+    let mut receipt = if let Some(hash) = target {
+        let op = &book.operations[book.index(hash)?];
+        (op.inbound && !matches!(op.phase, Phase::Complete | Phase::Failed | Phase::Expired))
+            .then(|| ReceiptTiming::new(hash))
+    } else {
+        None
+    };
+    let future = drive(account, rpc, book, target, receipt.as_mut());
     let deadline = async {
         if let Some(seconds) = timeout {
             tokio::time::sleep(Duration::from_secs(seconds)).await;
@@ -635,6 +683,10 @@ async fn wait(
         result = tokio::signal::ctrl_c() => { result?; println!("已停止本次等待；网络操作未取消。"); Ok(()) },
         _ = deadline => { println!("本次等待超时；网络操作未取消，结果需继续核对。"); Ok(()) },
     };
+    if let Some(receipt) = receipt {
+        let complete = book.operations[book.index(receipt.hash)?].phase == Phase::Complete;
+        receipt.finish(complete);
+    }
     if let Some(hash) = target {
         let op = &book.operations[book.index(hash)?];
         if op.phase != Phase::Complete
@@ -758,6 +810,7 @@ async fn drive(
     rpc: &Rpc,
     book: &mut Book,
     target: Option<Hash256>,
+    mut receipt: Option<&mut ReceiptTiming>,
 ) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.drive");
     if let Some(hash) = target {
@@ -771,6 +824,28 @@ async fn drive(
         }
     }
     let (id, wallet, local_reserve, remote_reserve) = channel::payment_context(account)?;
+    if let Some(receipt) = receipt.as_deref_mut() {
+        let op = &book.operations[book.index(receipt.hash)?];
+        let records = account
+            .session
+            .channel_signer(id.into())
+            .await?
+            .recovery_records()
+            .await?;
+        if op.release_started
+            || matches!(op.remote_status.as_deref(), Some("Received" | "Paid"))
+            || records.iter().any(|record| {
+                record
+                    .settlement
+                    .data
+                    .tlcs
+                    .iter()
+                    .any(|tlc| tlc.payment_hash == op.hash.into())
+            })
+        {
+            receipt.observe_tlc(op.hash, true);
+        }
+    }
     // Take the cursor before checking state so changes during this drive pass are retained.
     let mut revision = wait_channel_update(account, rpc, id, None).await?;
     wallet.check_network().await?;
@@ -865,7 +940,7 @@ async fn drive(
                 );
             }
         }
-        sign(account, rpc, book, id).await?;
+        sign(account, rpc, book, id, receipt.as_deref_mut()).await?;
         for i in 0..book.operations.len() {
             release(account, rpc, book, i, &wallet).await?;
         }
@@ -909,7 +984,12 @@ async fn drive(
                 );
             }
         }
+        let protocol_wait = receipt
+            .as_ref()
+            .filter(|receipt| receipt.processing.is_some())
+            .map(|_| crate::timings::Span::new("payment.receipt_protocol_wait"));
         revision = wait_channel_update(account, rpc, id, Some(revision)).await?;
+        drop(protocol_wait);
     }
 }
 async fn wait_channel_update(
@@ -1005,7 +1085,13 @@ async fn refresh(account: &ClientAccount, rpc: &Rpc, book: &mut Book, i: usize) 
     op.updated_at_ms = now_ms()?;
     book.save(&account.dir)
 }
-async fn sign(account: &mut ClientAccount, rpc: &Rpc, book: &mut Book, id: Hash256) -> Result<()> {
+async fn sign(
+    account: &mut ClientAccount,
+    rpc: &Rpc,
+    book: &mut Book,
+    id: Hash256,
+    receipt: Option<&mut ReceiptTiming>,
+) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.external_sign");
     let result: GetChannelSigningStatusResult = rpc
         .call(
@@ -1015,6 +1101,9 @@ async fn sign(account: &mut ClientAccount, rpc: &Rpc, book: &mut Book, id: Hash2
         )
         .await?;
     ensure!(result.channel_id == id, "签名请求属于其他通道");
+    if let Some(receipt) = receipt {
+        receipt.observe_status(&result.status);
+    }
     let ChannelSigningStatus::SignatureRequired {
         request_id,
         transition,
@@ -1308,6 +1397,26 @@ mod tests {
     };
     use fiber_types::Privkey;
     use std::{fs, os::unix::fs::PermissionsExt};
+
+    #[test]
+    fn receipt_timing_starts_only_for_its_own_inbound_tlc_and_never_restarts() {
+        crate::timings::enable(true);
+        let hash = Hash256([1; 32]);
+        let mut receipt = ReceiptTiming::new(hash);
+        receipt.observe_tlc(Hash256([2; 32]), true);
+        receipt.observe_tlc(hash, false);
+        assert!(receipt.processing.is_none());
+        assert_eq!(crate::timings::calls("payment.wait_for_receipt"), 0);
+        receipt.observe_tlc(hash, true);
+        assert!(receipt.processing.is_some());
+        assert!(receipt.waiting.is_none());
+        assert_eq!(crate::timings::calls("payment.wait_for_receipt"), 1);
+        receipt.observe_tlc(hash, true);
+        assert_eq!(crate::timings::calls("payment.receipt_processing"), 0);
+        receipt.finish(true);
+        assert_eq!(crate::timings::calls("payment.receipt_processing"), 1);
+        crate::timings::enable(false);
+    }
 
     #[tokio::test]
     async fn event_wait_checks_channel_and_preserves_payment_authorization() {
@@ -1718,7 +1827,9 @@ mod tests {
         );
         let before = fs::read(account.dir.path.join("signer.bin")).unwrap();
         let rpc = Rpc::new(&config.rpc_url).unwrap();
-        let error = sign(&mut account, &rpc, &mut book, id).await.unwrap_err();
+        let error = sign(&mut account, &rpc, &mut book, id, None)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("其他通道"));
         assert_eq!(
             fs::read(account.dir.path.join("signer.bin")).unwrap(),

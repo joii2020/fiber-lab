@@ -98,3 +98,9 @@
 LSP delivery 的 `Succeeded`、发票 `Paid`、SDK TLC 移除及余额增加是不同证据。最终成功要核对 SDK 双 lane 及远端余额；服务端报告不能代替本地证明。协作关闭仍拒绝未结算 TLC 或未同步的双 lane，退款依据结算后的 SDK 最新余额和原出资脚本，不再假设原注入余额。
 
 SDK 边界见 [fiber-lsp-sdk README](../../fiber/crates/fiber-lsp-sdk/README.md)。首期不支持 UDT、MPP、无金额发票、keysend、自动重试发送、后台常驻服务或链上 TLC 追偿。不自动清理运行数据或更换账户，也不自动开新通道。
+
+## 分阶段耗时
+
+`pay`、`create-invoice --wait`、`watch` 和 `resume` 使用 `--timings` 在命令结束时输出中文摘要，时间自动换算为秒、毫秒或微秒，多次阶段显示累计、次数及最长单次。准备时间是收付款流程进入 drive 前的区间，账户恢复属于其子项；外部签名下分 SDK、恢复资料保存和提交请求。状态刷新、收款释放及存储存在包含关系，不能把各行直接相加。单张发票的 create-invoice --wait / resume 另记 payment.wait_for_receipt（本次开始在线推进到首次观察到匹配 hash 的入账 TLC）和 payment.receipt_processing（该观察点到本次核对结束）。只排除前者，处理中的后续签名/结算等待仍计入收款处理，并通过 payment.receipt_protocol_wait 单列。不要从命令时间扣除整个 LSP 等待区间；旧聚合日志没有这个分界，不能回推出精确收款处理耗时。超时或中断会显示处理尚未完成，尚未观察到付款时不报告已完成的处理耗时。恢复命令只统计本次窗口，watch 多笔操作不冒充单笔延迟。
+
+`--timings-json` 保留原机器可读计时 schema，供自动基准采集；不与 `--timings` 同时使用。未指定两者时不采集或输出计时。

@@ -58,7 +58,7 @@ fn cli(options: &Options, args: &[&str], user: &str) -> Result<Child> {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     if options.timings {
-        command.arg("--timings");
+        command.arg("--timings-json");
     }
     Ok(command.spawn()?)
 }
@@ -266,7 +266,7 @@ async fn main() -> Result<()> {
             // A new invoice after an unknown outcome would obscure recovery and liquidity.
             // Preserve the failed attempt and stop instead of issuing another payment.
             bail!(
-                "attempt {attempt} incomplete; recover its original hash before continuing; result saved"
+                "attempt {attempt} incomplete; measured failures: {failures}; recover its original hash before continuing; result saved"
             );
         }
         if !warmup {

@@ -15,9 +15,12 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "./lsp-cli", about = "Fiber LSP 联调工具")]
 struct Cli {
-    /// 将分项计时 JSON 写入 stderr（不包含请求内容）
-    #[arg(long, global = true)]
+    /// 将中文分阶段耗时摘要写入 stderr
+    #[arg(long, global = true, conflicts_with = "timings_json")]
     timings: bool,
+    /// 将完整计时 JSON 写入 stderr，供自动基准使用
+    #[arg(long, global = true, conflicts_with = "timings")]
+    timings_json: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -116,11 +119,12 @@ enum AdminCommand {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = Cli::parse();
-    timings::enable(cli.timings);
+    let timings_json = cli.timings_json;
+    timings::enable(cli.timings || timings_json);
     let total = timings::Span::new("cli.total");
     let result = run(cli).await;
     drop(total);
-    timings::report(result.is_ok());
+    timings::report(result.is_ok(), timings_json);
     if let Err(error) = result {
         eprintln!("错误：{error:#}");
         std::process::exit(1);
