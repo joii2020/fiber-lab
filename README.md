@@ -224,6 +224,8 @@ bash scripts/clean.sh
 
 清理脚本先执行 `stop.sh`，成功后删除 offckb 的整个 CKB devnet 和全部 Fiber 节点（含 Node3 / LSP 的配置与密钥）、项目 `.state/` 下的所有数据，以及 `configs/keys/operator-token`。若停止失败，清理中止。删除后执行 `bash scripts/create.sh` 自动重建并启动整个环境。
 
+也可执行 `bash scripts/reset-all.sh` 一次完成清理、重新编译、创建并启动环境，然后为账户 1、2 开通道。此命令会删除上述全部运行数据；启动后每秒检查一次带管理 token 的 `lsp_get_status`，确认 LSP RPC 返回有效节点身份后才开通道，最多等待 120 秒。等待超时或任一步骤失败会退出；LSP 启动日志位于 `.state/devnet/lsp.log`。
+
 ## 原理与实现
 
 - [devnet 与节点管理](docs/devnet.md)：本地编译、节点分工、启动脚本、端口和运行数据。
