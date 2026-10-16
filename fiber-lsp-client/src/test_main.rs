@@ -60,3 +60,60 @@ fn historical_round_requires_fixed_account_and_recovery_preserves_round() {
     assert_eq!(options.recovery_selector(), "-u 2 --round 3");
     assert!(options.current_only().is_err());
 }
+
+#[test]
+fn connection_arguments_accept_url_and_token_without_server_config() {
+    for args in [
+        vec!["lsp-cli", "status", "-u", "1"],
+        vec!["lsp-cli", "create-channel", "-u", "1"],
+        vec!["lsp-cli", "close-channel", "-u", "1"],
+        vec!["lsp-cli", "pay", "invoice", "-u", "1"],
+        vec!["lsp-cli", "create-invoice", "--amount", "1", "-u", "1"],
+    ] {
+        let mut token_args = args.clone();
+        token_args.extend([
+            "--rpc-url",
+            "https://lsp.example/rpc",
+            "--token",
+            "registration-token",
+        ]);
+        assert!(Cli::try_parse_from(&token_args).is_ok());
+        token_args.extend(["--token-file", "token.txt"]);
+        assert!(Cli::try_parse_from(token_args).is_err());
+        let mut file_args = args;
+        file_args.extend([
+            "--rpc-url",
+            "https://lsp.example/rpc",
+            "--token-file",
+            "token.txt",
+        ]);
+        assert!(Cli::try_parse_from(file_args).is_ok());
+    }
+}
+
+#[test]
+fn offline_account_initialization_takes_a_url_without_server_configuration() {
+    let Some(Command::Admin {
+        command: AdminCommand::InitAccounts(options),
+    }) = Cli::try_parse_from(["lsp-cli", "admin", "init-accounts"])
+        .unwrap()
+        .command
+    else {
+        panic!()
+    };
+    assert_eq!(options.rpc_url, "http://127.0.0.1:21716");
+    assert!(
+        Cli::try_parse_from([
+            "lsp-cli",
+            "admin",
+            "init-accounts",
+            "--rpc-url",
+            "https://lsp.example/rpc"
+        ])
+        .is_ok()
+    );
+    assert!(
+        Cli::try_parse_from(["lsp-cli", "admin", "init-accounts", "--config", "node3.yml"])
+            .is_err()
+    );
+}

@@ -8,7 +8,9 @@
 
 以下命令均在 `fiber-lab` 根目录执行。已有环境请直接看 [启动和状态检查](#5-启动和状态检查)。
 
-`lsp-cli` 默认直接读取 offckb Node3 的配置，自动获取命令所需的信息。编译完成后，执行 `bash scripts/create.sh` 即可初始化 devnet、配置 LSP、生成管理 token 并启动节点，无需手工编辑 YAML 或运行 `biscuit keypair`。
+用户命令通过 `rpc_url + token` 接入 LSP，不接受 `--config`，不读取 LSP 服务端配置。只有 `admin init-lsp` 和 `admin create-token` 读取 Node3 配置。编译完成后，执行 `bash scripts/create.sh` 即可初始化 devnet、配置 LSP、生成管理 token 并启动节点，无需手工编辑 YAML 或运行 `biscuit keypair`。
+
+脚本连接 LSP 的地址统一在 `scripts/config.sh` 的 `RPC_URL` 中设置（默认 `http://127.0.0.1:21716`），`create.sh` 和 `reset-all.sh` 在初始化账户、检查服务就绪和开通道时使用它。该变量是客户端访问地址；服务端监听地址仍由 Node3 配置决定。已有账户继续使用保存的地址，修改此变量不会重绑已有账户。
 
 ### 1. 安装依赖并编译
 
@@ -35,7 +37,7 @@ Fiber 源码默认放在同级目录 `../fiber`，必须包含 LSP 实现和 `cr
 bash scripts/create.sh
 ```
 
-脚本先用本地编译的 `fnn` 初始化三个 Fiber 节点，保留 offckb 生成的链、合约、RPC 和带资金的出资账户配置；停止 Fiber 后，用 `admin init-lsp` 将 Node3 配置为 LSP、用 `admin init-accounts` 离线初始化四用户、签发管理 token，再启动 Node1、Node2 和独立 LSP。
+脚本先用本地编译的 `fnn` 初始化三个 Fiber 节点，保留 offckb 生成的链、合约、RPC 和带资金的出资账户配置；停止 Fiber 后，用 `admin init-lsp` 将 Node3 配置为 LSP、用 `admin init-accounts --rpc-url "$RPC_URL"` 离线初始化四用户、签发管理 token，再启动 Node1、Node2 和独立 LSP。
 
 `create.sh` 在已有 Node3 目录或管理 token 时提前退出，不覆盖已有环境，也不执行清理。它用于首次创建；已有环境的启动和状态检查见步骤 5。创建完成后可直接执行步骤 5 的状态检查，以及步骤 6 的账户操作。
 
@@ -107,18 +109,26 @@ curl --noproxy '*' -fsS http://127.0.0.1:21716 \
 ./lsp-cli status -u 1
 ```
 
+`admin init-accounts` 只创建本地身份、绑定公开钱包并预存目标 RPC URL（默认 `http://127.0.0.1:21716`，可用 `--rpc-url URL` 指定），不读取 Node3 配置、不连接 LSP、不读取 token。首次 `create-channel` 才完成注册并获得用户 token。`scripts/create.sh` 使用此入口初始化，`reset-all.sh` 随后为账户 1、2 注册并开通道。
+
 固定账户 1～4 永久绑定 offckb #6～#9，通过 `-u N` 操作；LSP / Public T 使用 #5。初始化创建四份独立 SDK 身份，尚不注册租户。每个账户内部按轮次保留身份、租户和历史，`accounts` 展示固定账户及本地状态，不显示当前轮次，`accounts --history` 展示各账户历轮；日常操作无需使用内部 `account-…` ID。重复初始化复用身份、钱包、当前轮次及历史，已关闭的空闲账户不会自动创建下一轮。旧 v1 身份保留原目录和密钥，迁移后标为“旧身份未绑定”，不会自动归给账户 1。
 
 `accounts` 和 `accounts --history` 将仅创建本地身份、尚未注册 LSP 的账户本地状态显示为 `unregistered`。
 
+首次接入指定 `--rpc-url URL`，注册授权凭证默认复用 `admin create-token` 已生成的 `configs/keys/operator-token`。接入其他 LSP 或使用其他凭证时，可用 `--token TOKEN` 或 `--token-file PATH` 覆盖默认值；两个 token 参数互斥，显式指定失败时不会回退默认文件。当前 devnet 使用已签发的管理 token 完成注册及首次开通前的 `node_info` 查询（需要 `read("lsp")`、`write("lsp")`、`read("node")`）。管理凭证仅在注册或首次开通查询出资条款时读取，不需要 Biscuit 公钥或公开配置导出文件。
+
+注册返回的用户 token、LSP 公钥及租户信息保存在本地账户中；日常查询、收付款和恢复已有开通意图直接复用，不再提供 token。注册绑定后，显式 `--rpc-url` 必须与账户保存的地址一致，不能自动重绑服务；尚未注册的离线身份允许用显式地址完成首次绑定。新轮次没有保存的地址，需要再次提供 URL；注册 token 继续默认复用本项目凭证。首次开通尚未保存意图时，也按相同规则读取凭证查询出资条款。
+
+开通道钱包仍使用本地 offckb：从普通 Node1 获取本地链与合约部署信息，通过目标 LSP 的 `node_info` 获取对方出资额、接受阈值与出资钱包，核对双方链一致后冻结条款。此流程不读取 Node3 的服务端配置；后续使用已保存的通道条款。
+
 注册与开通合并为一个命令：
 
 ```bash
-./lsp-cli create-channel -u 1 --funding-amount 1000
+./lsp-cli create-channel -u 1 --rpc-url http://127.0.0.1:21716 --funding-amount 1000
 ./lsp-cli status -u 1
 ./lsp-cli close-channel -u 1
 ./lsp-cli accounts --history
-./lsp-cli create-channel -u 1
+./lsp-cli create-channel -u 1 --rpc-url http://127.0.0.1:21716
 ```
 
 只有新开通意图默认出资 1000 CKB；恢复时省略金额会沿用原金额，显式指定须一致。开通须等待链上出资确认及 ChannelReady，关闭须等待链上关闭确认并核对双方最新结算余额退款。成功关闭后自动归档本轮，保留原身份、租户及收付款历史；下一次显式开通创建新身份和不同 tenant_id，仍归原用户及钱包。同一租户绑定过通道后无法再开新通道。
@@ -148,8 +158,8 @@ curl --noproxy '*' -fsS http://127.0.0.1:21716 \
 
 ```bash
 # 先串行准备通道并核对余额；已有通道可以复用
-./lsp-cli create-channel -u 1
-./lsp-cli create-channel -u 2
+./lsp-cli create-channel -u 1 --rpc-url http://127.0.0.1:21716
+./lsp-cli create-channel -u 2 --rpc-url http://127.0.0.1:21716
 ./lsp-cli status -u 1
 ./lsp-cli status -u 2
 
@@ -160,7 +170,7 @@ curl --noproxy '*' -fsS http://127.0.0.1:21716 \
 ./lsp-cli pay -u 2 '<invoice_address>' --timeout 120
 ```
 
-`create-invoice` 必须指定金额，发票有效期默认 3600 秒；创建后直接等待收款，不再使用 `--wait`。可用 `--timeout 120` 限制等待时间，默认一直等待。`pay` 使用 Fiber 默认费用预算（当前为金额的 0.5%，向上取整到 shannon），不提供费用参数，默认等待 120 秒；trampoline 可能花费完整费用预算。两条命令仅接受 `-u N` 当前轮次，并支持 `--config PATH`，不提供 `--account` 和 `--round` 参数。
+`create-invoice` 必须指定金额，发票有效期默认 3600 秒；创建后直接等待收款，不再使用 `--wait`。可用 `--timeout 120` 限制等待时间，默认一直等待。`pay` 使用 Fiber 默认费用预算（当前为金额的 0.5%，向上取整到 shannon），不提供费用参数，默认等待 120 秒；trampoline 可能花费完整费用预算。两条命令仅接受 `-u N` 当前轮次，不提供 `--account` 和 `--round` 参数。默认使用账户保存的 RPC 地址和用户 token，不需要配置文件。
 
 快速测试：`./scripts/test_send_and_pay.sh` 使用已开通通道的账户 1 收款、账户 2 付款，金额 1 CKB、使用 Fiber 默认费用预算（0.005 CKB）；结束后输出双方日志和耗时。脚本不会清理或重建环境。
 

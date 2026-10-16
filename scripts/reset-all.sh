@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euxo pipefail
 
-root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$root"
+source "$(dirname -- "${BASH_SOURCE[0]}")/config.sh"
 
 ./scripts/clean.sh
 ./scripts/build-fiber.sh
@@ -11,7 +10,7 @@ cd "$root"
 echo "等待 Fiber LSP 就绪（最多 120 秒）..."
 token="$(cat configs/keys/operator-token)"
 deadline=$((SECONDS + 120))
-until curl --noproxy '*' -fs --max-time 2 http://127.0.0.1:21716 \
+until curl --noproxy '*' -fs --max-time 2 "$RPC_URL" \
     -H 'Content-Type: application/json' \
     -H "Authorization: Bearer $token" \
     --data '{"jsonrpc":"2.0","id":1,"method":"lsp_get_status","params":[]}' \
@@ -20,5 +19,5 @@ until curl --noproxy '*' -fs --max-time 2 http://127.0.0.1:21716 \
     sleep 1
 done
 
-./lsp-cli create-channel -u 1
-./lsp-cli create-channel -u 2
+./lsp-cli create-channel -u 1 --rpc-url "$RPC_URL"
+./lsp-cli create-channel -u 2 --rpc-url "$RPC_URL"

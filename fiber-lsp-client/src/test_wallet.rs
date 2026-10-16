@@ -1,21 +1,4 @@
 use super::*;
-#[test]
-fn omitted_funding_uses_fnn_default_and_explicit_values_are_preserved() {
-    let config: FiberConfig = serde_yaml::from_str("chain: devnet.toml\nscripts: []\n").unwrap();
-    assert_eq!(config.remote_funding_amount(), 100 * CKB);
-    let config: FiberConfig = serde_yaml::from_str(
-        "chain: devnet.toml\nscripts: []\nauto_accept_channel_ckb_funding_amount: null\n",
-    )
-    .unwrap();
-    assert_eq!(config.remote_funding_amount(), 100 * CKB);
-    for amount in [0, 99 * CKB, 200 * CKB] {
-        let config: FiberConfig = serde_yaml::from_str(&format!(
-            "chain: devnet.toml\nscripts: []\nauto_accept_channel_ckb_funding_amount: {amount}\n"
-        ))
-        .unwrap();
-        assert_eq!(config.remote_funding_amount(), amount);
-    }
-}
 pub fn terms() -> Terms {
     let key = secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
     let hash = ckb_hash::blake2b_256(key.public_key(secp256k1::SECP256K1).serialize());

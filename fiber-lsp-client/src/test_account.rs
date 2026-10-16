@@ -10,13 +10,13 @@ use serde_json::{Value, json};
 
 use super::*;
 
-pub(crate) fn fixture() -> (tempfile::TempDir, Config, TcpListener) {
+pub(crate) fn fixture() -> (tempfile::TempDir, Connection, TcpListener) {
     let root = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let config = Config {
+    let config = Connection {
         root: root.path().to_path_buf(),
         rpc_url: format!("http://{}", listener.local_addr().unwrap()),
-        rpc_auth_public_key: "test-biscuit-key".to_owned(),
+        registration_token: Some(Zeroizing::new("operator-test-token".into())),
     };
     fs::create_dir_all(root.path().join("configs/keys")).unwrap();
     fs::write(
@@ -121,7 +121,8 @@ pub(crate) fn serve(
 
 #[tokio::test]
 async fn interrupted_identity_registration_and_restore_use_the_same_account() {
-    let (_root, config, listener) = fixture();
+    let (_root, mut config, listener) = fixture();
+    config.registration_token = None;
     let dir = AccountDir::lock(&config.account_dir()).unwrap();
     let (mut record, _) = initialize(&dir, &config).await.unwrap();
     record.registration = Registration::AwaitingResult;
@@ -150,6 +151,13 @@ async fn interrupted_identity_registration_and_restore_use_the_same_account() {
     );
     drop(dir);
     let created = run(&config, true, None).await.unwrap();
+    let saved: Value = created.client.dir.read_json().unwrap();
+    assert_eq!(saved["rpc_url"], config.rpc_url);
+    assert!(
+        !serde_json::to_string(&saved)
+            .unwrap()
+            .contains("operator-test-token")
+    );
     assert_eq!(created.identity, identity);
     assert_eq!(created.tenant_id, id);
     assert!(created.channels.is_empty());
@@ -227,13 +235,13 @@ async fn malformed_registration_response_retains_pending_progress() {
 #[tokio::test]
 async fn configuration_and_identity_mismatch_leave_files_unchanged() {
     let (_root, mut config, _listener) = fixture();
-    let dir = AccountDir::lock(&config.account_dir()).unwrap();
-    initialize(&dir, &config).await.unwrap();
+    let dir = test_registered(&config).await.dir;
     let original = fs::read(dir.path.join("account.json")).unwrap();
-    config.rpc_auth_public_key = "another-key".to_owned();
+    let original_url = config.rpc_url.clone();
+    config.rpc_url = "http://another-lsp:80".into();
     let error = restore(&dir, &config).await.err().unwrap().to_string();
     assert!(error.contains("关联不一致"));
-    config.rpc_auth_public_key = "test-biscuit-key".to_owned();
+    config.rpc_url = original_url;
     atomic_write(&dir.path.join("root-key"), &[3; 32]).unwrap();
     let error = restore(&dir, &config).await.err().unwrap().to_string();
     assert!(error.contains("不匹配"));
@@ -241,8 +249,9 @@ async fn configuration_and_identity_mismatch_leave_files_unchanged() {
 }
 
 #[tokio::test]
-async fn missing_operator_token_keeps_the_initial_identity() {
-    let (_root, config, _listener) = fixture();
+async fn missing_registration_token_keeps_the_initial_identity() {
+    let (_root, mut config, _listener) = fixture();
+    config.registration_token = None;
     fs::remove_file(config.root.join("configs/keys/operator-token")).unwrap();
     assert!(
         run(&config, true, None)
@@ -250,7 +259,7 @@ async fn missing_operator_token_keeps_the_initial_identity() {
             .err()
             .unwrap()
             .to_string()
-            .contains("operator-token")
+            .contains("--token")
     );
     let dir = crate::accounts::select(&config.root, None, false).unwrap();
     let account_path = dir.path.clone();
@@ -304,4 +313,109 @@ async fn rpc_failures_preserve_registered_account_without_operator_token() {
     for (name, bytes) in crate::store::ACCOUNT_FILES.iter().zip(before) {
         assert_eq!(fs::read(config.account_dir().join(name)).unwrap(), bytes);
     }
+}
+
+#[tokio::test]
+async fn saved_account_connects_without_config_or_bootstrap_token_and_accepts_legacy_metadata() {
+    let (_root, config, listener) = fixture();
+    let account = test_registered(&config).await;
+    // Older account files contain this field; it is no longer an input to connecting.
+    let mut legacy: Value = account.dir.read_json().unwrap();
+    legacy["rpc_auth_public_key"] = json!("legacy-biscuit-key");
+    account.dir.save_json(&legacy).unwrap();
+    fs::remove_file(config.root.join("configs/keys/operator-token")).unwrap();
+    let before = fs::read(account.dir.path.join("account.json")).unwrap();
+    let mut connection =
+        Connection::connect(&crate::ConnectionOptions::default(), &account.dir).unwrap();
+    assert_eq!(connection.rpc_url, config.rpc_url);
+    assert!(connection.registration_token.is_none());
+    connection.root = config.root.clone();
+    let server = serve(
+        listener,
+        vec![
+            ("list_channels", json!({"channels": []})),
+            ("list_channels", json!({"channels": []})),
+        ],
+    );
+    let dir = account.dir;
+    let restored = run_dir(&connection, false, dir).await.unwrap();
+    assert_eq!(
+        restored.client.session.tenant_token(),
+        Some("user-test-token")
+    );
+    assert_eq!(
+        fs::read(restored.client.dir.path.join("account.json")).unwrap(),
+        before
+    );
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn explicit_rpc_override_cannot_rebind_a_saved_account() {
+    let (_root, config, _listener) = fixture();
+    let account = test_registered(&config).await;
+    let before = fs::read(account.dir.path.join("account.json")).unwrap();
+    let options = crate::ConnectionOptions {
+        rpc_url: Some("https://another-lsp.example/rpc".into()),
+        ..Default::default()
+    };
+    let mut connection = Connection::connect(&options, &account.dir).unwrap();
+    connection.root = config.root.clone();
+    assert!(
+        restore(&account.dir, &connection)
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("关联不一致")
+    );
+    assert_eq!(
+        fs::read(account.dir.path.join("account.json")).unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn first_registration_binds_advertised_url_instead_of_offline_listen_address() {
+    let (_root, config, listener) = fixture();
+    let dir = AccountDir::lock(&config.account_dir()).unwrap();
+    let (mut record, _) = initialize(&dir, &config).await.unwrap();
+    record.rpc_url = "http://offline-listen-address:21716".into();
+    dir.save_json(&record).unwrap();
+    let (mut record, mut session) = restore(&dir, &config).await.unwrap();
+    let server = serve(
+        listener,
+        vec![
+            ("lsp_get_status", lsp_status()),
+            ("lsp_list_tenants", json!({"tenants": []})),
+            (
+                "lsp_get_tenant_registry_nonce",
+                json!({
+                    "lsp_node_id": lsp_key(), "root_signer_pubkey": record.identity_public_key,
+                    "nonce": format!("0x{}", "05".repeat(32))
+                }),
+            ),
+            (
+                "lsp_register_tenant",
+                json!({"tenant": tenant(&record), "access_token": "user-test-token"}),
+            ),
+        ],
+    );
+    register(
+        &dir,
+        &config,
+        &Rpc::new(&config.rpc_url).unwrap(),
+        &mut record,
+        &mut session,
+    )
+    .await
+    .unwrap();
+    let saved: Value = dir.read_json().unwrap();
+    assert_eq!(saved["rpc_url"], config.rpc_url);
+    assert!(
+        !serde_json::to_string(&saved)
+            .unwrap()
+            .contains("operator-test-token")
+    );
+    server.join().unwrap();
 }

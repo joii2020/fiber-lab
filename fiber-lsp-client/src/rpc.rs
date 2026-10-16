@@ -1,6 +1,5 @@
 use std::{
     env, fs,
-    net::SocketAddr,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
@@ -13,14 +12,14 @@ use fiber_json_types::{
     RegisterLspTenantResult,
 };
 use reqwest::header::{AUTHORIZATION, HeaderValue};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
-pub struct Config {
+pub struct Connection {
     pub root: PathBuf,
     pub rpc_url: String,
-    pub rpc_auth_public_key: String,
+    pub registration_token: Option<Zeroizing<String>>,
 }
 
 pub fn config_path(path: Option<&Path>) -> Result<PathBuf> {
@@ -46,59 +45,59 @@ fn node3_config(
     Ok(data.join("offckb-nodejs/devnet/fiber/nodes/3/config.yml"))
 }
 
-impl Config {
-    pub fn load(path: Option<&Path>) -> Result<Self> {
-        let path = config_path(path)?;
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .context("无法定位 fiber-lab 项目目录")?;
-        Self::from_path(root, &path)
-    }
-
-    fn from_path(root: &Path, path: &Path) -> Result<Self> {
-        #[derive(Deserialize)]
-        struct ProjectConfig {
-            rpc: RpcConfig,
-        }
-        #[derive(Deserialize)]
-        struct RpcConfig {
-            listening_addr: String,
-            biscuit_public_key: String,
-        }
-        let bytes = fs::read(path)
-            .with_context(|| format!("无法读取 {}；请检查路径或指定 --config", path.display()))?;
-        let project: ProjectConfig = serde_yaml::from_slice(&bytes).map_err(|_| {
-            anyhow::anyhow!(
-                "{} 的 YAML 无效，或缺少 rpc.listening_addr / rpc.biscuit_public_key",
-                path.display()
-            )
-        })?;
-        let address: SocketAddr = project.rpc.listening_addr.parse().with_context(|| {
-            format!(
-                "{} 的 rpc.listening_addr 不是有效的 IP:端口",
-                path.display()
-            )
-        })?;
-        if project.rpc.biscuit_public_key.trim().is_empty() {
-            bail!("{} 的 rpc.biscuit_public_key 为空", path.display());
-        }
+impl Connection {
+    pub fn new(
+        root: PathBuf,
+        rpc_url: String,
+        registration_token: Option<Zeroizing<String>>,
+    ) -> Result<Self> {
+        let url = reqwest::Url::parse(&rpc_url).context("LSP RPC URL 无效")?;
+        anyhow::ensure!(
+            matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none(),
+            "LSP RPC URL 必须为不含凭证的 HTTP(S) 地址"
+        );
         Ok(Self {
-            root: root.to_path_buf(),
-            rpc_url: format!("http://{address}"),
-            rpc_auth_public_key: project.rpc.biscuit_public_key,
+            root,
+            rpc_url,
+            registration_token,
         })
     }
 
-    pub fn operator_token(&self) -> Result<Zeroizing<String>> {
-        let path = self.root.join("configs/keys/operator-token");
-        let text = Zeroizing::new(
-            fs::read_to_string(&path)
-                .with_context(|| format!("无法读取管理凭证 {}", path.display()))?,
-        );
-        if text.trim().is_empty() {
-            bail!("管理凭证文件 {} 为空", path.display());
+    pub fn connect(
+        options: &crate::ConnectionOptions,
+        dir: &crate::store::AccountDir,
+    ) -> Result<Self> {
+        let saved: Option<Value> = if dir.is_initialized()? {
+            Some(dir.read_json()?)
+        } else {
+            None
+        };
+        let rpc_url = options
+            .rpc_url
+            .clone()
+            .or_else(|| saved.as_ref()?.get("rpc_url")?.as_str().map(str::to_owned))
+            .context("首次接入必须指定 --rpc-url")?;
+        Self::new(crate::accounts::root(), rpc_url, options.read_token()?)
+    }
+
+    /// Read the bootstrap credential only when registration or initial opening needs it.
+    pub fn registration_token(&self) -> Result<Zeroizing<String>> {
+        if let Some(token) = &self.registration_token {
+            return Ok(token.clone());
         }
-        Ok(Zeroizing::new(text.trim().to_owned()))
+        let path = self.root.join("configs/keys/operator-token");
+        let token = Zeroizing::new(fs::read_to_string(&path).with_context(|| {
+            format!("无法读取默认管理凭证 {}；请先执行 admin create-token，或通过 --token / --token-file 指定", path.display())
+        })?);
+        anyhow::ensure!(
+            !token.trim().is_empty(),
+            "默认管理凭证 {} 为空",
+            path.display()
+        );
+        Ok(Zeroizing::new(token.trim().to_owned()))
     }
 
     #[cfg(test)]

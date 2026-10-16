@@ -1,64 +1,35 @@
-use std::{fs, process::Command};
+use std::process::Command;
 
 #[test]
-fn client_commands_read_offckb_config_from_xdg_or_home() {
-    let temp = tempfile::tempdir().unwrap();
-    for (xdg, base) in [
-        (Some("data"), "data"),
-        (None, "home/.local/share"),
-        (Some(""), "home/.local/share"),
+fn client_commands_reject_config_and_removed_export_command() {
+    for args in [
+        vec!["status", "-u", "1"],
+        vec!["create-channel", "-u", "1"],
+        vec!["close-channel", "-u", "1"],
+        vec!["pay", "invoice", "-u", "1"],
+        vec!["create-invoice", "--amount", "1", "-u", "1"],
     ] {
-        let config = temp
-            .path()
-            .join(base)
-            .join("offckb-nodejs/devnet/fiber/nodes/3/config.yml");
-        fs::create_dir_all(config.parent().unwrap()).unwrap();
-        // Fail during configuration loading, before touching the real account.
-        fs::write(&config, "rpc: {}\n").unwrap();
-        for subcommand in ["status", "create-channel", "close-channel"] {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_fiber-lsp-client"));
-            command
-                .current_dir(temp.path())
-                .env("HOME", temp.path().join("home"))
-                .env_remove("XDG_DATA_HOME")
-                .args([subcommand, "-u", "1"]);
-            if let Some(xdg) = xdg {
-                command.env(
-                    "XDG_DATA_HOME",
-                    if xdg.is_empty() {
-                        std::path::PathBuf::new()
-                    } else {
-                        temp.path().join(xdg)
-                    },
-                );
-            }
-            let result = command.output().unwrap();
-            let error = String::from_utf8(result.stderr).unwrap();
-            assert!(!result.status.success());
-            assert!(error.contains(config.to_str().unwrap()), "{error}");
-            assert!(error.contains("rpc.listening_addr"), "{error}");
-        }
-    }
-}
-
-#[test]
-fn explicit_config_is_relative_to_cwd_and_needs_no_home() {
-    let temp = tempfile::tempdir().unwrap();
-    let config = temp.path().join("custom.yml");
-    fs::write(&config, "rpc: {}\n").unwrap();
-    for subcommand in ["status", "create-channel", "close-channel"] {
         let result = Command::new(env!("CARGO_BIN_EXE_fiber-lsp-client"))
-            .current_dir(temp.path())
+            .args(args)
+            .args(["--config", "server.yml"])
             .env_remove("HOME")
             .env_remove("XDG_DATA_HOME")
-            .args([subcommand, "-u", "1", "--config", "custom.yml"])
             .output()
             .unwrap();
         let error = String::from_utf8(result.stderr).unwrap();
         assert!(!result.status.success());
-        assert!(error.contains(config.to_str().unwrap()), "{error}");
-        assert!(error.contains("rpc.listening_addr"), "{error}");
+        assert!(error.contains("unexpected argument '--config'"), "{error}");
     }
+    let result = Command::new(env!("CARGO_BIN_EXE_fiber-lsp-client"))
+        .args(["admin", "export-client-config"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8(result.stderr)
+            .unwrap()
+            .contains("unrecognized subcommand")
+    );
 }
 
 #[test]

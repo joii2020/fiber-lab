@@ -11,7 +11,7 @@ offckb fiber start --nodes 3 --binary-path "$FNN_BINARY" --daemon
 offckb fiber stop
 
 ./lsp-cli admin init-lsp --config "$LSP_DIR/config.yml"
-./lsp-cli admin init-accounts --config "$LSP_DIR/config.yml"
+./lsp-cli admin init-accounts --rpc-url "$RPC_URL"
 ./lsp-cli admin create-token --config "$LSP_DIR/config.yml"
 
 bash "$ROOT/scripts/start.sh"

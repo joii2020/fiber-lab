@@ -1,7 +1,7 @@
 //! One durable lifecycle intent per hosted tenant (the current SDK/server limit).
 use crate::{
     account::ClientAccount,
-    rpc::{Config, Rpc},
+    rpc::{Connection, Rpc},
     store::{AccountDir, atomic_write, read_private},
     wallet::{CKB, RESERVE, Terms, Wallet},
 };
@@ -19,16 +19,13 @@ use fiber_lsp_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{
-    path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Args)]
 #[group(skip)]
 pub struct OpenOptions {
-    #[arg(long, value_name = "PATH")]
-    pub config: Option<PathBuf>,
+    #[command(flatten)]
+    pub connection: crate::ConnectionOptions,
     /// 仅历史关闭入口
     #[arg(long, value_name = "ID", hide = true)]
     pub account: Option<String>,
@@ -46,8 +43,8 @@ pub struct OpenOptions {
 #[group(skip)]
 #[command(group(clap::ArgGroup::new("close_selector").args(["user", "account"]).required(true).multiple(false)))]
 pub struct CloseOptions {
-    #[arg(long, value_name = "PATH")]
-    pub config: Option<PathBuf>,
+    #[command(flatten)]
+    pub connection: crate::ConnectionOptions,
     /// 兼容旧数据的内部身份 ID；日常历史操作使用 -u N --round R
     #[arg(long, value_name = "ID")]
     pub account: Option<String>,
@@ -223,17 +220,18 @@ pub async fn open(options: OpenOptions) -> Result<()> {
             user: options.user,
             account: options.account.clone(),
         },
-        config: options.config.clone(),
+        connection: options.connection.clone(),
         round: None,
     };
     client.current_only()?;
-    let config = Config::load(options.config.as_deref())?;
-    let original_binding = crate::accounts::funding_for(&config.root, options.user.unwrap())?;
+    let root = crate::accounts::root();
+    let original_binding = crate::accounts::funding_for(&root, options.user.unwrap())?;
     ensure!(
         crate::wallet::public_binding(original_binding.offckb_index)? == original_binding,
         "用户钱包公开绑定不一致；未分配身份或注册"
     );
-    let (dir, selection) = crate::accounts::choose(&config.root, &client, true, false, true)?;
+    let (dir, selection) = crate::accounts::choose(&root, &client, true, false, true)?;
+    let config = Connection::connect(&options.connection, &dir)?;
     let binding = selection.funding.as_ref().unwrap();
     ensure!(
         original_binding == *binding,
@@ -261,13 +259,7 @@ pub async fn open(options: OpenOptions) -> Result<()> {
         ),
     )
     .await;
-    finish_command(
-        result,
-        &account.dir,
-        "create-channel",
-        options.config.as_ref(),
-        Some(&client),
-    )
+    finish_command(result, &account.dir, "create-channel", Some(&client))
 }
 
 async fn open_bound(
@@ -330,15 +322,19 @@ async fn open_engine(
                 amount(u128::from(funding))
             );
         }
-        let wallet = Wallet::load(
-            options.config.as_deref(),
-            binding.context("新开通缺少用户钱包绑定")?,
-        )
-        .await?;
+        let connection = Connection::connect(&options.connection, &account.dir)?;
+        let bootstrap = connection.registration_token()?;
+        let node: fiber_json_types::NodeInfoResult =
+            rpc.call("node_info", json!([]), &bootstrap).await?;
+        ensure!(
+            node.pubkey == account.lsp_public_key,
+            "LSP 出资条款公钥与账户绑定不一致"
+        );
+        let wallet = Wallet::load(binding.context("新开通缺少用户钱包绑定")?, &node).await?;
         ensure!(funding > RESERVE, "出资额必须大于 99 CKB 保留金额");
         ensure!(
             wallet.terms.auto_accept_min != 0 && funding >= wallet.terms.auto_accept_min,
-            "未满足 Node3 自动接受阈值或自动接受已关闭；不能自动修改服务配置"
+            "未满足 LSP 自动接受阈值或自动接受已关闭；不能自动修改服务配置"
         );
         funding
             .checked_add(wallet.terms.remote_amount)
@@ -675,11 +671,12 @@ pub async fn close(options: CloseOptions) -> Result<()> {
             user: options.user,
             account: options.account.clone(),
         },
-        config: options.config.clone(),
+        connection: options.connection.clone(),
         round: options.round,
     };
-    let config = Config::load(options.config.as_deref())?;
-    let (dir, selection) = crate::accounts::choose(&config.root, &client, false, true, false)?;
+    let root = crate::accounts::root();
+    let (dir, selection) = crate::accounts::choose(&root, &client, false, true, false)?;
+    let config = Connection::connect(&options.connection, &dir)?;
     crate::accounts::check_historical_close(&config.root, &selection)?;
     let local: serde_json::Value = dir.read_json()?;
     if local["registration"] != "registered" && read_intent(&dir)?.is_none() {
@@ -695,13 +692,7 @@ pub async fn close(options: CloseOptions) -> Result<()> {
         close_inner(&options, &mut account, &rpc),
     )
     .await;
-    let outcome = finish_command(
-        result,
-        &account.dir,
-        "close-channel",
-        options.config.as_ref(),
-        Some(&client),
-    )?;
+    let outcome = finish_command(result, &account.dir, "close-channel", Some(&client))?;
     drop(account);
     if let CloseResult::ClosedVerified { channel_id, hash } = outcome {
         crate::accounts::archive_verified(&config.root, &selection, channel_id, &hash)
@@ -1007,7 +998,6 @@ fn finish_command<T>(
     result: std::result::Result<Result<T>, tokio::time::error::Elapsed>,
     dir: &AccountDir,
     command: &str,
-    config: Option<&PathBuf>,
     selector: Option<&crate::ClientOptions>,
 ) -> Result<T> {
     let error = match result {
@@ -1019,14 +1009,11 @@ fn finish_command<T>(
         .map(|i| format!("{:?}", i.stage))
         .unwrap_or_else(|| "尚未保存意图".into());
     let account = dir.path.file_name().unwrap().to_string_lossy();
-    let config = config
-        .map(|p| format!(" --config {}", p.display()))
-        .unwrap_or_default();
     let selector = selector.map_or_else(
         || format!("--account {account}"),
         crate::ClientOptions::recovery_selector,
     );
-    Err(error.context(format!("当前阶段：{stage}；原数据保留。恢复命令：./lsp-cli {command} {selector}{config}；查询：./lsp-cli status {selector}{config}")))
+    Err(error.context(format!("当前阶段：{stage}；原数据保留。恢复命令：./lsp-cli {command} {selector}；查询：./lsp-cli status {selector}")))
 }
 
 pub fn count(channels: &[Channel]) -> &'static str {

@@ -98,7 +98,7 @@ fn signed_invoice(account: &ClientAccount, op: &Operation) -> InvoiceResult {
         invoice: parsed.into(),
     }
 }
-async fn fixture_operation(config: &Config, inbound: bool) -> (ClientAccount, Operation) {
+async fn fixture_operation(config: &Connection, inbound: bool) -> (ClientAccount, Operation) {
     let mut account = test_registered(config).await;
     let op = operation(&mut account, inbound).await;
     drop(account);
@@ -193,7 +193,7 @@ fn online_commands_only_accept_current_user_selection() {
             assert!(crate::Cli::try_parse_from(invalid).is_err());
         }
         let mut current = args.clone();
-        current.extend(["-u", "4", "--config", "node3.yml"]);
+        current.extend(["-u", "4", "--rpc-url", "http://localhost:21716"]);
         assert!(crate::Cli::try_parse_from(&current).is_ok());
         let mut historical = current;
         historical.extend(["--round", "1"]);

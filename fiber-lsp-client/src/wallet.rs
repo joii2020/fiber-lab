@@ -1,5 +1,5 @@
 //! Independent CKB wallet checks and default-lock signing. No secrets cross the RPC boundary.
-use crate::rpc::{Rpc, config_path};
+use crate::rpc::Rpc;
 use anyhow::{Context, Result, bail, ensure};
 use ckb_sdk::{
     traits::{CellDepResolver, DefaultCellDepResolver, SecpCkbRawKeySigner, Signer},
@@ -11,7 +11,7 @@ use fiber_json_types::{OpenChannelWithExternalFundingParams, OpenTenantChannelRe
 use fiber_lsp_sdk::{FundingVerifier, OpeningNetwork, SessionError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashSet, path::Path};
+use std::collections::HashSet;
 use zeroize::Zeroizing;
 
 pub const CKB: u64 = 100_000_000;
@@ -26,16 +26,6 @@ const LSP_FUNDING_ACCOUNT: usize = 5;
 struct FiberConfig {
     chain: String,
     scripts: Vec<Contract>,
-    open_channel_auto_accept_min_ckb_funding_amount: Option<u64>,
-    auto_accept_channel_ckb_funding_amount: Option<u64>,
-}
-
-impl FiberConfig {
-    fn remote_funding_amount(&self) -> u64 {
-        // fnn reserves 99 CKB occupied capacity plus 1 CKB shutdown fee.
-        self.auto_accept_channel_ckb_funding_amount
-            .unwrap_or(RESERVE + CKB)
-    }
 }
 
 #[derive(Deserialize)]
@@ -95,8 +85,8 @@ impl Wallet {
     }
 
     pub async fn load(
-        config: Option<&Path>,
         binding: &crate::accounts::FundingBinding,
+        lsp: &fiber_json_types::NodeInfoResult,
     ) -> Result<Self> {
         #[derive(Deserialize)]
         struct LocalConfig {
@@ -107,9 +97,20 @@ impl Wallet {
         struct CkbConfig {
             rpc_url: String,
         }
-        let path = config_path(config)?;
-        let cfg: LocalConfig = serde_yaml::from_slice(&std::fs::read(&path)?)
-            .map_err(|_| anyhow::anyhow!("Node3 配置缺少 ckb.rpc_url、fiber.chain 或合约部署"))?;
+        // The lab wallet uses its own local Node1 chain/deployments, never LSP files.
+        let data = std::env::var_os("XDG_DATA_HOME")
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|value| !value.is_empty())
+                    .map(|home| std::path::PathBuf::from(home).join(".local/share"))
+            })
+            .context("offckb 钱包需要 XDG_DATA_HOME 或 HOME")?;
+        let path = data.join("offckb-nodejs/devnet/fiber/nodes/1/config.yml");
+        let cfg: LocalConfig = serde_yaml::from_slice(&std::fs::read(&path)?).map_err(|_| {
+            anyhow::anyhow!("本地 Node1 钱包链配置缺少 ckb.rpc_url、fiber.chain 或合约部署")
+        })?;
         let spec: toml::Value = toml::from_str(&std::fs::read_to_string(
             path.parent().unwrap().join(&cfg.fiber.chain),
         )?)?;
@@ -144,7 +145,7 @@ impl Wallet {
         let public = public_binding(binding.offckb_index)?;
         ensure!(&public == binding, "用户钱包公开绑定与运行时 offckb 不一致");
         let wallet_lock = public.lock_script;
-        let remote_wallet_lock = funding_account(LSP_FUNDING_ACCOUNT, false)?.lock_script;
+        let remote_wallet_lock = lsp.default_funding_lock_script.clone();
         validate_default_lock(&wallet_lock)?;
         validate_default_lock(&remote_wallet_lock)?;
         ensure!(
@@ -160,7 +161,11 @@ impl Wallet {
         let dep = resolver
             .resolve(&wallet_lock.clone().into())
             .context("genesis 中无法解析默认 lock dep")?;
-        let remote_amount = cfg.fiber.remote_funding_amount();
+        ensure!(
+            genesis_hash.as_bytes() == lsp.chain_hash.0,
+            "LSP 与本地钱包的链不一致"
+        );
+        let remote_amount = lsp.auto_accept_channel_ckb_funding_amount;
         let terms = Terms {
             ckb_rpc_url: cfg.ckb.rpc_url,
             genesis_hash,
@@ -183,10 +188,7 @@ impl Wallet {
             wallet_account: binding.offckb_index,
             remote_wallet_lock: Some(remote_wallet_lock),
             remote_amount,
-            auto_accept_min: cfg
-                .fiber
-                .open_channel_auto_accept_min_ckb_funding_amount
-                .unwrap_or(100 * CKB),
+            auto_accept_min: lsp.open_channel_auto_accept_min_ckb_funding_amount,
             max_fee: MAX_FEE,
             funding_fee_rate: FEE_RATE,
             close_fee_rate: FEE_RATE,

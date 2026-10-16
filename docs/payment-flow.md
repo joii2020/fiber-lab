@@ -20,11 +20,11 @@
 
 ```bash
 ./lsp-cli admin init-accounts
-./lsp-cli create-channel --funding-amount 1000 -u 1
+./lsp-cli create-channel --funding-amount 1000 -u 1 --rpc-url http://127.0.0.1:21716
 ./lsp-cli status -u 1
 ```
 
-开通使用已有账户及 LSP 公钥，读取本地 Node3 的链与通道配置，用户 1～4 分别从 offckb #6～#9 出资（示例用户 1 为 #6），LSP / Public T 从 #5 出资。示例中本方 1000 CKB（含 100 CKB 保留金额：99 CKB 占用容量和 1 CKB 关闭手续费）、新初始化环境对方默认 1000 CKB，通道总出资为 2000 CKB 加实际交易费，#6 无需承担对方注入额。钱包核验双方 inputs、各自找零、合约、实际扣款和费用后，仅签名 #6 的 inputs，SDK 核验开通条款和初始 commitment；最终等待链上出资确认及 `ChannelReady`。
+开通使用已有账户及 LSP 公钥，从本地普通 Node1 读取钱包链与合约部署，通过 LSP 的 `node_info` 查询出资条款并核对链一致，用户 1～4 分别从 offckb #6～#9 出资（示例用户 1 为 #6），LSP / Public T 从 #5 出资。示例中本方 1000 CKB（含 100 CKB 保留金额：99 CKB 占用容量和 1 CKB 关闭手续费）、新初始化环境对方默认 1000 CKB，通道总出资为 2000 CKB 加实际交易费，#6 无需承担对方注入额。钱包核验双方 inputs、各自找零、合约、实际扣款和费用后，仅签名 #6 的 inputs，SDK 核验开通条款和初始 commitment；最终等待链上出资确认及 `ChannelReady`。
 
 `status` 同时展示账户信息和当前账户的通道、余额、出资 / 关闭 hash 和待恢复阶段；查询不提交任何签名。中断后 `./lsp-cli create-channel -u 1` 核对并恢复原意图，不改变身份或重复出资。
 

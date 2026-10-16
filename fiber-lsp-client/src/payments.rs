@@ -2,7 +2,7 @@
 use crate::{
     account::ClientAccount,
     channel,
-    rpc::{Config, MissingRecord, Rpc},
+    rpc::{Connection, MissingRecord, Rpc},
     wallet::{CKB, Wallet},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -179,8 +179,9 @@ async fn ready_channel(account: &ClientAccount, rpc: &Rpc, id: Hash256) -> Resul
 pub async fn pay(options: PayOptions) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.pay");
     let client = crate::ClientOptions::from(options.client);
-    let config = Config::load(client.config.as_deref())?;
-    let (dir, _selection) = crate::accounts::choose(&config.root, &client, false, false, false)?;
+    let (dir, _selection) =
+        crate::accounts::choose(&crate::accounts::root(), &client, false, false, false)?;
+    let config = Connection::connect(&client.connection, &dir)?;
     let mut account = ClientAccount::load_dir(&config, dir).await?;
     account.session = account.session.with_policy(SigningPolicy::Manual);
     let rpc = Rpc::new(&config.rpc_url)?;
@@ -236,8 +237,9 @@ pub async fn pay(options: PayOptions) -> Result<()> {
 pub async fn create_invoice(options: InvoiceOptions) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.invoice");
     let client = crate::ClientOptions::from(options.client);
-    let config = Config::load(client.config.as_deref())?;
-    let (dir, _selection) = crate::accounts::choose(&config.root, &client, false, false, false)?;
+    let (dir, _selection) =
+        crate::accounts::choose(&crate::accounts::root(), &client, false, false, false)?;
+    let config = Connection::connect(&client.connection, &dir)?;
     let mut account = ClientAccount::load_dir(&config, dir).await?;
     account.session = account.session.with_policy(SigningPolicy::Manual);
     let rpc = Rpc::new(&config.rpc_url)?;

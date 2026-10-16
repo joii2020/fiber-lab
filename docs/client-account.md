@@ -6,19 +6,19 @@
 ./lsp-cli admin init-lsp
 ./lsp-cli admin init-accounts
 ./lsp-cli accounts
-./lsp-cli create-channel -u 1 --funding-amount 1000
+./lsp-cli create-channel -u 1 --rpc-url http://127.0.0.1:21716 --funding-amount 1000
 ./lsp-cli status -u 1
 ./lsp-cli close-channel -u 1
 ./lsp-cli accounts --history
 ./lsp-cli status -u 1 --round 1
-./lsp-cli create-channel -u 1
+./lsp-cli create-channel -u 1 --rpc-url http://127.0.0.1:21716
 ```
 
-`init-lsp` 只配置 LSP 和 Biscuit 密钥。`init-accounts` 离线读取已初始化配置及 offckb 公开钱包，创建四份独立本地 SDK 身份，不连接 RPC、不注册、不读取管理 token、不更改 YAML 或 LSP 密钥。重复初始化保留当前/空闲状态及历史。初始化中断会保留已写入绑定、预留 ID 和身份；重试补全完成标记，若 SDK 文件不完整则拒绝重新生成密钥。
+`init-lsp` 只配置 LSP 和 Biscuit 密钥。`init-accounts` 通过 `--rpc-url URL` 预存目标地址（默认 `http://127.0.0.1:21716`），离线读取 offckb 公开钱包，不读取 Node3 配置，创建四份独立本地 SDK 身份，不连接 RPC、不注册、不读取管理 token、不更改 YAML 或 LSP 密钥。重复初始化保留当前/空闲状态及历史。初始化中断会保留已写入绑定、预留 ID 和身份；重试补全完成标记，若 SDK 文件不完整则拒绝重新生成密钥。
 
-默认配置为 `${XDG_DATA_HOME:-$HOME/.local/share}/offckb-nodejs/devnet/fiber/nodes/3/config.yml`，可用 `--config PATH` 指定。恢复核对保存的 RPC 地址、Biscuit 公钥、身份、tenant_id 及用户归属；不允许重绑另一服务或转移租户。
+用户命令不接受 `--config`。首次接入指定 `--rpc-url URL`，默认复用 `configs/keys/operator-token`；可用 `--token TOKEN` 或 `--token-file PATH` 覆盖注册凭证；后续复用账户保存的地址和用户 token。恢复核对 RPC 地址、身份、tenant_id 及用户归属，不要求 Biscuit 公钥。尚未注册的离线身份可用显式 URL 完成首次绑定；注册绑定后不允许重绑另一服务或转移租户。旧账户中的 Biscuit 公钥字段兼容读取，但不再用于接入校验。
 
-`create-channel -u N` 在同一账户锁下注册并开通。已注册身份恢复不再读取管理 token；新注册使用 `configs/keys/operator-token`。注册请求发送前落盘等待标记；响应丢失先核对原租户，服务端存在而本地凭证缺失时明确停止，不盲目另注册。新意图默认 1000 CKB，恢复省略金额沿用原值。
+`create-channel -u N` 在同一账户锁下注册并开通。已注册身份恢复不读取管理 token；新注册默认读取本项目已生成的 `configs/keys/operator-token`，显式 token 参数可覆盖。首次开通在冻结意图前需要该凭证调用 `node_info` 获取 LSP 出资条款，钱包从本地 Node1 获取链与合约部署，核对双方链一致；保存意图后恢复不再需要注册 token。新轮次需重新提供 URL，注册 token 仍默认复用本项目凭证。注册请求发送前落盘等待标记；响应丢失先核对原租户，服务端存在而本地凭证缺失时明确停止，不盲目另注册。新意图默认 1000 CKB，恢复省略金额沿用原值。
 
 开通核对链、原条款、inputs、出资、找零和费率，出资签名仅签对应用户钱包的 inputs。提交前查链，已知交易不重复提交；签名响应丢失复用相同请求和本地签名，SDK 拒绝冲突签名。
 

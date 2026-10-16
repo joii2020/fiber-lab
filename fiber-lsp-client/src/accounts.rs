@@ -601,7 +601,10 @@ fn archive_with_write(
     Ok(())
 }
 
-pub async fn init_users(config: &crate::rpc::Config, bindings: Vec<FundingBinding>) -> Result<()> {
+pub async fn init_users(
+    config: &crate::rpc::Connection,
+    bindings: Vec<FundingBinding>,
+) -> Result<()> {
     ensure!(
         bindings.len() == 4
             && bindings

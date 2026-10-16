@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::{
-    rpc::{Config, Rpc},
+    rpc::{Connection, Rpc},
     store::{AccountDir, FileSignerStore, atomic_write, read_private},
 };
 
@@ -23,7 +23,6 @@ struct AccountRecord {
     user: Option<u8>,
     format_version: u32,
     rpc_url: String,
-    rpc_auth_public_key: String,
     lsp_public_key: Option<Pubkey>,
     identity_public_key: Pubkey,
     tenant_id: String,
@@ -41,12 +40,16 @@ pub struct AccountStatus {
 }
 
 #[cfg(test)]
-pub async fn run(config: &Config, create: bool, selected: Option<&str>) -> Result<AccountStatus> {
+pub async fn run(
+    config: &Connection,
+    create: bool,
+    selected: Option<&str>,
+) -> Result<AccountStatus> {
     let dir = crate::accounts::select(&config.root, selected, create)?;
     run_dir(config, create, dir).await
 }
 
-pub async fn run_dir(config: &Config, create: bool, dir: AccountDir) -> Result<AccountStatus> {
+pub async fn run_dir(config: &Connection, create: bool, dir: AccountDir) -> Result<AccountStatus> {
     let id = dir.path.file_name().unwrap().to_string_lossy();
     let recovery = registration_recovery(config, &id)?;
     let (mut record, mut session) = if dir.is_initialized()? {
@@ -109,12 +112,12 @@ pub struct ClientAccount {
 
 impl ClientAccount {
     #[cfg(test)]
-    pub async fn load(config: &Config, selected: Option<&str>) -> Result<Self> {
+    pub async fn load(config: &Connection, selected: Option<&str>) -> Result<Self> {
         let dir = crate::accounts::select(&config.root, selected, false)?;
         Self::load_dir(config, dir).await
     }
 
-    pub async fn load_dir(config: &Config, dir: AccountDir) -> Result<Self> {
+    pub async fn load_dir(config: &Connection, dir: AccountDir) -> Result<Self> {
         let _timing = crate::timings::Span::new("cli.account_restore");
         let id = dir.path.file_name().unwrap().to_string_lossy();
         let recovery = registration_recovery(config, &id)?;
@@ -158,7 +161,7 @@ impl fiber_lsp_sdk::OpeningPersistence for AccountDir {
 
 async fn initialize(
     dir: &AccountDir,
-    config: &Config,
+    config: &Connection,
 ) -> Result<(AccountRecord, HostedSession<FileSignerStore>)> {
     let created = RootSigner::create_random(FileSignerStore::new(dir))
         .await
@@ -174,7 +177,6 @@ async fn initialize(
         )?,
         format_version: 1,
         rpc_url: config.rpc_url.clone(),
-        rpc_auth_public_key: config.rpc_auth_public_key.clone(),
         lsp_public_key: None,
         identity_public_key: Pubkey(session.identity_public_key().serialize()),
         tenant_id: session.tenant_id().as_str().to_owned(),
@@ -189,7 +191,7 @@ async fn initialize(
 
 async fn restore(
     dir: &AccountDir,
-    config: &Config,
+    config: &Connection,
 ) -> Result<(AccountRecord, HostedSession<FileSignerStore>)> {
     let record: AccountRecord = dir.read_json()?;
     let owner = crate::accounts::owner_for(
@@ -202,11 +204,12 @@ async fn restore(
     if record.format_version != 1 {
         bail!("account.json 的格式版本不支持；原文件已保留");
     }
-    if record.rpc_url != config.rpc_url || record.rpc_auth_public_key != config.rpc_auth_public_key
+    // Offline initialization has not yet established a remote LSP identity.
+    // The first registration may use its advertised URL instead of a local listen address.
+    if record.rpc_url != config.rpc_url
+        && !(record.registration == Registration::IdentitySaved && record.lsp_public_key.is_none())
     {
-        bail!(
-            "当前配置的 RPC 地址或 Biscuit 公钥与保存的 LSP 关联不一致；原账户已保留，不能用于另一套服务"
-        );
+        bail!("RPC 地址与保存的 LSP 关联不一致；原账户已保留，不能用于另一套服务");
     }
     let bytes = Zeroizing::new(read_private(&dir.path.join("root-key"))?);
     let secret =
@@ -253,12 +256,13 @@ fn validate_tenant(tenant: &LspTenantStatus, record: &AccountRecord) -> Result<(
 
 async fn register(
     dir: &AccountDir,
-    config: &Config,
+    config: &Connection,
     rpc: &Rpc,
     record: &mut AccountRecord,
     session: &mut HostedSession<FileSignerStore>,
 ) -> Result<()> {
-    let operator = config.operator_token()?;
+    let operator = config.registration_token()?;
+    record.rpc_url = config.rpc_url.clone();
     let status = rpc.get_status(&operator).await?;
     match record.lsp_public_key {
         Some(saved) if saved != status.public_node_id => {
@@ -317,7 +321,7 @@ async fn register(
 }
 
 #[cfg(test)]
-pub async fn test_registered(config: &Config) -> ClientAccount {
+pub async fn test_registered(config: &Connection) -> ClientAccount {
     let dir = AccountDir::lock(&config.account_dir()).unwrap();
     let (mut record, mut session) = initialize(&dir, config).await.unwrap();
     let lsp_public_key = Pubkey(RootKey::import([2; 32]).unwrap().public_key().serialize());
@@ -357,7 +361,7 @@ pub(crate) fn save_test_state(dir: &AccountDir, state: &HostedSessionState) {
 }
 
 /// Offline identity initialization; partial files are never replaced.
-pub async fn init_local(dir: &AccountDir, config: &Config) -> Result<()> {
+pub async fn init_local(dir: &AccountDir, config: &Connection) -> Result<()> {
     if dir.is_initialized()? {
         restore(dir, config).await?;
     } else {
@@ -366,14 +370,14 @@ pub async fn init_local(dir: &AccountDir, config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn registration_recovery(config: &Config, id: &str) -> Result<String> {
+fn registration_recovery(config: &Connection, id: &str) -> Result<String> {
     Ok(crate::accounts::owner_for(&config.root, id)?.map_or_else(
         || "旧未绑定身份不能通过历史入口重新注册；保留资料核对原注册结果".into(),
-        |u| format!("执行 ./lsp-cli create-channel -u {u}，继续使用原 --config"),
+        |u| format!("执行 ./lsp-cli create-channel -u {u}，继续使用原 RPC 地址；注册未完成时默认复用本项目管理凭证，可用 --token 或 --token-file 覆盖"),
     ))
 }
 
-pub async fn verify_local(dir: &AccountDir, config: &Config) -> Result<()> {
+pub async fn verify_local(dir: &AccountDir, config: &Connection) -> Result<()> {
     restore(dir, config).await?;
     Ok(())
 }

@@ -60,14 +60,45 @@ struct Selector {
     account: Option<String>,
 }
 
+#[derive(Args, Default, Clone)]
+struct ConnectionOptions {
+    /// LSP RPC 地址；已有账户默认复用保存的地址
+    #[arg(long, value_name = "URL")]
+    rpc_url: Option<String>,
+    /// 覆盖默认管理凭证；仅首次注册或开通时使用
+    #[arg(long, value_name = "TOKEN", conflicts_with = "token_file")]
+    token: Option<String>,
+    /// 从文件覆盖管理凭证；默认 configs/keys/operator-token
+    #[arg(long, value_name = "PATH", conflicts_with = "token")]
+    token_file: Option<PathBuf>,
+}
+impl ConnectionOptions {
+    fn read_token(&self) -> Result<Option<zeroize::Zeroizing<String>>> {
+        let token = match (&self.token, &self.token_file) {
+            (Some(token), _) => Some(token.clone()),
+            (_, Some(path)) => Some(
+                std::fs::read_to_string(path)
+                    .map_err(|_| anyhow::anyhow!("无法读取 token 文件 {}", path.display()))?,
+            ),
+            _ => None,
+        };
+        token
+            .map(|token| {
+                let token = zeroize::Zeroizing::new(token);
+                ensure!(!token.trim().is_empty(), "token 不能为空");
+                Ok(zeroize::Zeroizing::new(token.trim().to_owned()))
+            })
+            .transpose()
+    }
+}
+
 #[derive(Args)]
 struct CurrentClientOptions {
     /// 固定账户编号 1～4（当前轮次）
     #[arg(short = 'u', long, value_parser = clap::value_parser!(u8).range(1..=4))]
     user: u8,
-    /// Node3 配置路径
-    #[arg(long, value_name = "PATH")]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    connection: ConnectionOptions,
 }
 impl From<CurrentClientOptions> for ClientOptions {
     fn from(options: CurrentClientOptions) -> Self {
@@ -77,7 +108,7 @@ impl From<CurrentClientOptions> for ClientOptions {
                 account: None,
             },
             round: None,
-            config: options.config,
+            connection: options.connection,
         }
     }
 }
@@ -89,9 +120,8 @@ struct ClientOptions {
     /// 选择固定账户的历史轮次（accounts --history 展示）
     #[arg(long, value_name = "R", value_parser = clap::value_parser!(u32).range(1..), requires = "user", conflicts_with = "account")]
     round: Option<u32>,
-    /// Node3 配置路径
-    #[arg(long, value_name = "PATH")]
-    config: Option<PathBuf>,
+    #[command(flatten)]
+    connection: ConnectionOptions,
 }
 impl std::ops::Deref for ClientOptions {
     type Target = Selector;
@@ -178,8 +208,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::CreateChannel(options) => channel::open(options).await?,
         Command::CloseChannel(options) => channel::close(options).await?,
         Command::Status(options) => {
-            let config = rpc::Config::load(options.config.as_deref())?;
-            let (dir, _selection) = accounts::choose(&config.root, &options, false, true, false)?;
+            let (dir, _selection) =
+                accounts::choose(&accounts::root(), &options, false, true, false)?;
+            let config = rpc::Connection::connect(&options.connection, &dir)?;
             account::verify_local(&dir, &config).await?;
             let local: serde_json::Value = dir.read_json()?;
             println!("本地注册阶段：{}", local["registration"]);

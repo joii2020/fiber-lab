@@ -135,7 +135,7 @@ async fn restored_amount_or_tenant_mismatch_stops_before_open_rpc() {
     let options = OpenOptions {
         account: None,
         user: None,
-        config: None,
+        connection: crate::ConnectionOptions::default(),
         funding_amount: Some(1001 * CKB),
         timeout: 1,
     };
@@ -490,7 +490,7 @@ async fn lost_opening_response_retains_pending_signer_and_original_request() {
     let options = OpenOptions {
         account: None,
         user: None,
-        config: None,
+        connection: crate::ConnectionOptions::default(),
         funding_amount: None,
         timeout: 1,
     };
@@ -710,7 +710,7 @@ async fn explicit_foreign_channel_is_rejected_without_signing_or_shutdown() {
         account: None,
         user: None,
         round: None,
-        config: None,
+        connection: crate::ConnectionOptions::default(),
         channel_id: Some(Hash256([9; 32])),
         timeout: 1,
     };

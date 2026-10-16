@@ -22,25 +22,6 @@ fn rejects_mismatched_response_and_redacts_server_errors() {
 }
 
 #[test]
-fn missing_config_fields_name_the_file_and_field() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("config.yml");
-    let error = Config::from_path(root.path(), &path)
-        .err()
-        .unwrap()
-        .to_string();
-    assert!(error.contains(path.to_str().unwrap()));
-    assert!(error.contains("--config"));
-    fs::write(&path, "rpc: {}\n").unwrap();
-    let error = Config::from_path(root.path(), &path)
-        .err()
-        .unwrap()
-        .to_string();
-    assert!(error.contains(path.to_str().unwrap()));
-    assert!(error.contains("rpc.listening_addr"));
-}
-
-#[test]
 fn default_config_needs_home_only_without_xdg() {
     assert_eq!(
         node3_config(Some("/data".into()), None).unwrap(),
@@ -61,27 +42,87 @@ fn default_config_needs_home_only_without_xdg() {
 }
 
 #[test]
-fn external_config_keeps_account_and_token_in_project() {
+fn connection_initialization_needs_only_a_url_and_keeps_accounts_local() {
     let root = tempfile::tempdir().unwrap();
-    let node = tempfile::tempdir().unwrap();
-    let path = node.path().join("config.yml");
-    fs::write(
-        &path,
-        "services: [fiber, lsp]\nrpc:\n  listening_addr: 127.0.0.1:21716\n  biscuit_public_key: test-key\n  biscuit_private_key_path: /unused/key\n",
+    let connection = Connection::new(
+        root.path().to_path_buf(),
+        "https://lsp.example/rpc".into(),
+        None,
     )
     .unwrap();
-    let config = Config::from_path(root.path(), &path).unwrap();
-    assert_eq!(config.rpc_url, "http://127.0.0.1:21716");
-    assert_eq!(config.rpc_auth_public_key, "test-key");
+    assert!(connection.registration_token.is_none());
     assert_eq!(
-        config.account_dir(),
+        connection.account_dir(),
         root.path().join(".state/fiber-lsp-client/default")
     );
-    fs::create_dir_all(root.path().join("configs/keys")).unwrap();
-    fs::write(
-        root.path().join("configs/keys/operator-token"),
-        "test-token",
-    )
-    .unwrap();
-    assert_eq!(config.operator_token().unwrap().as_str(), "test-token");
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn fresh_connection_uses_only_url_and_explicit_token() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = crate::store::AccountDir::lock(&root.path().join("account")).unwrap();
+    assert!(
+        Connection::connect(&crate::ConnectionOptions::default(), &dir)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("--rpc-url")
+    );
+    for url in [
+        "file:///tmp/lsp",
+        "http://user:secret@localhost",
+        "not-a-url",
+    ] {
+        let options = crate::ConnectionOptions {
+            rpc_url: Some(url.into()),
+            ..Default::default()
+        };
+        assert!(Connection::connect(&options, &dir).is_err());
+    }
+    let path = root.path().join("registration-token");
+    fs::write(&path, "  bootstrap-secret\n").unwrap();
+    let options = crate::ConnectionOptions {
+        rpc_url: Some("https://lsp.example/rpc".into()),
+        token_file: Some(path),
+        ..Default::default()
+    };
+    let connection = Connection::connect(&options, &dir).unwrap();
+    assert_eq!(connection.rpc_url, "https://lsp.example/rpc");
+    assert_eq!(
+        connection.registration_token().unwrap().as_str(),
+        "bootstrap-secret"
+    );
+    assert!(!dir.is_initialized().unwrap());
+    let empty = crate::ConnectionOptions {
+        token: Some("  ".into()),
+        ..Default::default()
+    };
+    assert!(empty.read_token().is_err());
+}
+
+#[test]
+fn registration_uses_default_token_lazily_and_explicit_token_takes_priority() {
+    let root = tempfile::tempdir().unwrap();
+    let mut connection = Connection {
+        root: root.path().to_path_buf(),
+        rpc_url: "https://lsp.example/rpc".into(),
+        registration_token: None,
+    };
+    assert!(connection.registration_token().is_err());
+    let path = root.path().join("configs/keys/operator-token");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "  generated-token\n").unwrap();
+    assert_eq!(
+        connection.registration_token().unwrap().as_str(),
+        "generated-token"
+    );
+    connection.registration_token = Some(Zeroizing::new("override-token".into()));
+    fs::write(&path, "").unwrap();
+    assert_eq!(
+        connection.registration_token().unwrap().as_str(),
+        "override-token"
+    );
+    connection.registration_token = None;
+    assert!(connection.registration_token().is_err());
 }

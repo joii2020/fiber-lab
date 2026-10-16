@@ -80,7 +80,7 @@ read("node");
 
 ## 管理操作与客户端操作
 
-`lsp-cli admin create-token` 是操作者的管理命令，显式读取服务端私钥。`create-channel -u N` 和 `status` 只读取操作所需的 token，不读取服务端私钥，也不自动签发管理凭证。
+`lsp-cli admin create-token` 是操作者的管理命令，显式读取服务端私钥。用户命令不接受 `--config`、不读取服务端配置或私钥，也不自动签发管理凭证。首次 `create-channel -u N` 指定 `--rpc-url URL`，默认读取本项目已生成的 `configs/keys/operator-token`；`--token TOKEN` / `--token-file PATH` 可覆盖默认凭证；后续 `status`、收付款和已有通道恢复使用账户保存的地址与用户 token。
 
 当前实验环境由联调操作者持管理凭证执行首次注册；注册成功后，服务端返回用户凭证，客户端保存它并用于后续用户操作。面向普通用户的注册服务尚未实现。注册步骤与恢复限制见 [客户端账户](client-account.md)。
 

@@ -24,7 +24,7 @@
 
 本项目使用 Node1、Node2 作为普通 Fiber 节点，Node3 作为 LSP。
 
-首次初始化时，执行 `bash scripts/create.sh`。脚本通过 offckb 先启动三个普通节点，生成当前 devnet 的链配置、合约配置、RPC 地址、端口、CKB 私钥和密码。随后停止 Fiber，执行 `lsp-cli admin init-lsp` 将 Node3 配置为 LSP，再执行 `admin create-token` 生成管理凭证，最后调用 `start.sh` 启动普通节点与 LSP。CKB 在配置期间继续运行，无需手动填写合约哈希或导入 CKB 私钥。
+首次初始化时，执行 `bash scripts/create.sh`。脚本通过 offckb 先启动三个普通节点，生成当前 devnet 的链配置、合约配置、RPC 地址、端口、CKB 私钥和密码。随后停止 Fiber，执行 `lsp-cli admin init-lsp` 将 Node3 配置为 LSP，用 `admin init-accounts --rpc-url http://127.0.0.1:21716` 离线创建四用户，再执行 `admin create-token` 生成管理凭证，最后调用 `start.sh` 启动普通节点与 LSP。CKB 在配置期间继续运行，无需手动填写合约哈希或导入 CKB 私钥。
 
 创建脚本要求 Node3 目录与管理 token 均不存在，已有环境时提前退出，避免 offckb 重写 Node3 配置。`clean.sh` 成功后可再次运行创建脚本；创建脚本不会自动清理任何数据。
 
@@ -65,7 +65,7 @@
 | `.state/fiber-lsp-client/accounts/<ID>/` | 各轮身份、租户凭证、SDK 与通道恢复资料；已有旧付款文件保留 |
 | `.state/fiber-lsp-client/default/` | 旧版历史账户；升级不移动 |
 
-客户端默认直接读取 offckb Node3 的 `config.yml`，也可用 `--config PATH` 指定配置。`configs/keys/` 和 `.state/` 已加入 Git 忽略规则，由使用者在本地生成。
+只有 `admin init-lsp` 和 `admin create-token` 读取 offckb Node3 的 `config.yml`；`admin init-accounts` 只需目标 RPC URL 和 offckb 公开钱包。用户命令不接受 `--config`，首次注册指定 `--rpc-url URL`，默认复用 `configs/keys/operator-token`，可用 `--token TOKEN` / `--token-file PATH` 覆盖，后续复用本地账户保存的地址与用户 token。首次开通时联调钱包从本地普通 Node1 读取链和合约部署，并通过 LSP RPC 查询出资条款。`configs/keys/` 和 `.state/` 已加入 Git 忽略规则，由使用者在本地生成。
 
 停止和重启不清理链、节点或账户数据。节点的密码与加密后的 CKB 密钥需要一起保留；客户端账户文件的关联见 [客户端账户](client-account.md)。
 

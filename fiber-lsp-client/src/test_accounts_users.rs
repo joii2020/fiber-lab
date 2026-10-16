@@ -12,18 +12,18 @@ fn bindings() -> Vec<FundingBinding> {
         })
         .collect()
 }
-fn config(root: &Path) -> crate::rpc::Config {
-    crate::rpc::Config {
+fn config(root: &Path) -> crate::rpc::Connection {
+    crate::rpc::Connection {
         root: root.to_path_buf(),
         rpc_url: "http://127.0.0.1:1".into(),
-        rpc_auth_public_key: "test-key".into(),
+        registration_token: None,
     }
 }
 fn options(user: Option<u8>, account: Option<String>) -> crate::ClientOptions {
     crate::ClientOptions {
         selector: crate::Selector { user, account },
         round: None,
-        config: None,
+        connection: crate::ConnectionOptions::default(),
     }
 }
 #[tokio::test]
