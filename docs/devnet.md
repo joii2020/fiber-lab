@@ -65,7 +65,7 @@
 | `.state/fiber-lsp-client/accounts/<ID>/` | 各轮身份、租户凭证、SDK 与通道恢复资料；已有旧付款文件保留 |
 | `.state/fiber-lsp-client/default/` | 旧版历史账户；升级不移动 |
 
-只有 `admin init-lsp` 和 `admin create-token` 读取 offckb Node3 的 `config.yml`；`admin init-accounts` 只需目标 RPC URL 和 offckb 公开钱包。用户命令不接受 `--config`，首次注册指定 `--rpc-url URL`，默认复用 `configs/keys/operator-token`，可用 `--token TOKEN` / `--token-file PATH` 覆盖，后续复用本地账户保存的地址与用户 token。首次开通时联调钱包从本地普通 Node1 读取链和合约部署，并通过 LSP RPC 查询出资条款。`configs/keys/` 和 `.state/` 已加入 Git 忽略规则，由使用者在本地生成。
+只有 `admin init-lsp` 和 `admin create-token` 读取 offckb Node3 的 `config.yml`；`admin init-accounts` 只需目标 RPC URL 和 offckb 公开钱包。用户命令不接受 `--config`，每次用户命令必须指定 `--rpc-url URL`，默认复用 `configs/keys/operator-token`，可用 `--token TOKEN` / `--token-file PATH` 覆盖，后续仍需显式指定地址，并复用本地账户保存的用户 token。首次开通时联调钱包从本地普通 Node1 读取链和合约部署，并通过 LSP RPC 查询出资条款。`configs/keys/` 和 `.state/` 已加入 Git 忽略规则，由使用者在本地生成。
 
 停止和重启不清理链、节点或账户数据。节点的密码与加密后的 CKB 密钥需要一起保留；客户端账户文件的关联见 [客户端账户](client-account.md)。
 

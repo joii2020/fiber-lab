@@ -10,7 +10,7 @@
 
 用户命令通过 `rpc_url + token` 接入 LSP，不接受 `--config`，不读取 LSP 服务端配置。只有 `admin init-lsp` 和 `admin create-token` 读取 Node3 配置。编译完成后，执行 `bash scripts/create.sh` 即可初始化 devnet、配置 LSP、生成管理 token 并启动节点，无需手工编辑 YAML 或运行 `biscuit keypair`。
 
-脚本连接 LSP 的地址统一在 `scripts/config.sh` 的 `RPC_URL` 中设置（默认 `http://127.0.0.1:21716`），`create.sh` 和 `reset-all.sh` 在初始化账户、检查服务就绪和开通道时使用它。该变量是客户端访问地址；服务端监听地址仍由 Node3 配置决定。已有账户继续使用保存的地址，修改此变量不会重绑已有账户。
+脚本连接 LSP 的地址统一在 `scripts/config.sh` 的 `RPC_URL` 中设置（默认 `http://127.0.0.1:21716`），`create.sh` 和 `reset-all.sh` 在初始化账户、检查服务就绪和开通道时使用它。该变量是客户端访问地址；服务端监听地址仍由 Node3 配置决定。每次用户命令都必须指定 `--rpc-url`；已注册账户会校验地址，修改此变量不会重绑已有账户。
 
 ### 1. 安装依赖并编译
 
@@ -106,7 +106,7 @@ curl --noproxy '*' -fsS http://127.0.0.1:21716 \
 ./lsp-cli admin init-accounts
 ./lsp-cli accounts
 ./lsp-cli accounts --history
-./lsp-cli status -u 1
+./lsp-cli status -u 1 --rpc-url http://127.0.0.1:21716
 ```
 
 `admin init-accounts` 只创建本地身份、绑定公开钱包并预存目标 RPC URL（默认 `http://127.0.0.1:21716`，可用 `--rpc-url URL` 指定），不读取 Node3 配置、不连接 LSP、不读取 token。首次 `create-channel` 才完成注册并获得用户 token。`scripts/create.sh` 使用此入口初始化，`reset-all.sh` 随后为账户 1、2 注册并开通道。
@@ -115,9 +115,9 @@ curl --noproxy '*' -fsS http://127.0.0.1:21716 \
 
 `accounts` 和 `accounts --history` 将仅创建本地身份、尚未注册 LSP 的账户本地状态显示为 `unregistered`。
 
-首次接入指定 `--rpc-url URL`，注册授权凭证默认复用 `admin create-token` 已生成的 `configs/keys/operator-token`。接入其他 LSP 或使用其他凭证时，可用 `--token TOKEN` 或 `--token-file PATH` 覆盖默认值；两个 token 参数互斥，显式指定失败时不会回退默认文件。当前 devnet 使用已签发的管理 token 完成注册及首次开通前的 `node_info` 查询（需要 `read("lsp")`、`write("lsp")`、`read("node")`）。管理凭证仅在注册或首次开通查询出资条款时读取，不需要 Biscuit 公钥或公开配置导出文件。
+每次用户命令必须指定 `--rpc-url URL`，注册授权凭证默认复用 `admin create-token` 已生成的 `configs/keys/operator-token`。接入其他 LSP 或使用其他凭证时，可用 `--token TOKEN` 或 `--token-file PATH` 覆盖默认值；两个 token 参数互斥，显式指定失败时不会回退默认文件。当前 devnet 使用已签发的管理 token 完成注册及首次开通前的 `node_info` 查询（需要 `read("lsp")`、`write("lsp")`、`read("node")`）。管理凭证仅在注册或首次开通查询出资条款时读取，不需要 Biscuit 公钥或公开配置导出文件。
 
-注册返回的用户 token、LSP 公钥及租户信息保存在本地账户中；日常查询、收付款和恢复已有开通意图直接复用，不再提供 token。注册绑定后，显式 `--rpc-url` 必须与账户保存的地址一致，不能自动重绑服务；尚未注册的离线身份允许用显式地址完成首次绑定。新轮次没有保存的地址，需要再次提供 URL；注册 token 继续默认复用本项目凭证。首次开通尚未保存意图时，也按相同规则读取凭证查询出资条款。
+注册返回的用户 token、LSP 公钥及租户信息保存在本地账户中；日常查询、收付款和恢复已有开通意图直接复用，不再提供 token。每次调用必须指定 `--rpc-url`；注册绑定后，该地址必须与账户保存的地址一致，不能自动重绑服务；尚未注册的离线身份允许用显式地址完成首次绑定。注册 token 继续默认复用本项目凭证。首次开通尚未保存意图时，也按相同规则读取凭证查询出资条款。
 
 开通道钱包仍使用本地 offckb：从普通 Node1 获取本地链与合约部署信息，通过目标 LSP 的 `node_info` 获取对方出资额、接受阈值与出资钱包，核对双方链一致后冻结条款。此流程不读取 Node3 的服务端配置；后续使用已保存的通道条款。
 
@@ -125,8 +125,8 @@ curl --noproxy '*' -fsS http://127.0.0.1:21716 \
 
 ```bash
 ./lsp-cli create-channel -u 1 --rpc-url http://127.0.0.1:21716 --funding-amount 1000
-./lsp-cli status -u 1
-./lsp-cli close-channel -u 1
+./lsp-cli status -u 1 --rpc-url http://127.0.0.1:21716
+./lsp-cli close-channel -u 1 --rpc-url http://127.0.0.1:21716
 ./lsp-cli accounts --history
 ./lsp-cli create-channel -u 1 --rpc-url http://127.0.0.1:21716
 ```
@@ -140,10 +140,10 @@ curl --noproxy '*' -fsS http://127.0.0.1:21716 \
 开关命令默认等待 120 秒，`--timeout SECONDS` 只停止本次等待，不撤销已提交请求、签名或交易。中断后执行原用户和配置的同一命令，不要删除数据：
 
 ```bash
-./lsp-cli create-channel -u 1       # 恢复原开通，无需再填金额
-./lsp-cli close-channel -u 1        # 恢复关闭；资金已关闭但归档失败时也重试此命令
-./lsp-cli status -u 1 --round 1    # 查询账户 1 的历史第 1 轮
-./lsp-cli close-channel -u 1 --round 1  # 核对历史关闭结果
+./lsp-cli create-channel -u 1 --rpc-url http://127.0.0.1:21716 # 恢复原开通，无需再填金额
+./lsp-cli close-channel -u 1 --rpc-url http://127.0.0.1:21716 # 恢复关闭；资金已关闭但归档失败时也重试此命令
+./lsp-cli status -u 1 --round 1 --rpc-url http://127.0.0.1:21716 # 查询账户 1 的历史第 1 轮
+./lsp-cli close-channel -u 1 --round 1 --rpc-url http://127.0.0.1:21716 # 核对历史关闭结果
 ```
 
 日常操作必须显式选择固定账户 `-u N`。status、close-channel 可加 `--round R` 选择该账户的历史轮次；轮次从 1 开始，按清单内创建顺序编号，包括当前轮次，只有已归档轮次允许通过历史入口操作。历史选择不切换当前轮次，并持有同一账户锁。当前轮次直接用 `-u N`；pay、create-invoice、create-channel 不允许选择历史轮次。兼容旧数据的 `--account ID` 入口仍保留，与 `-u N`、`--round R` 互斥。无通道关闭不归档，未结算 TLC、退款校验失败或链上未确认也不归档。同账户命令互斥，新开通另有全局锁，四账户链上开通串行。
@@ -160,14 +160,14 @@ curl --noproxy '*' -fsS http://127.0.0.1:21716 \
 # 先串行准备通道并核对余额；已有通道可以复用
 ./lsp-cli create-channel -u 1 --rpc-url http://127.0.0.1:21716
 ./lsp-cli create-channel -u 2 --rpc-url http://127.0.0.1:21716
-./lsp-cli status -u 1
-./lsp-cli status -u 2
+./lsp-cli status -u 1 --rpc-url http://127.0.0.1:21716
+./lsp-cli status -u 2 --rpc-url http://127.0.0.1:21716
 
 # 终端 A：输出 invoice_address 后保持运行，等待这一笔收款完成
-./lsp-cli create-invoice -u 1 --amount 1 --expiry 3600
+./lsp-cli create-invoice -u 1 --amount 1 --expiry 3600 --rpc-url http://127.0.0.1:21716
 
 # 终端 B：复制上面的完整地址并付款，保持运行直到完成
-./lsp-cli pay -u 2 '<invoice_address>' --timeout 120
+./lsp-cli pay -u 2 '<invoice_address>' --timeout 120 --rpc-url http://127.0.0.1:21716
 ```
 
 `create-invoice` 必须指定金额，发票有效期默认 3600 秒；创建后直接等待收款，不再使用 `--wait`。可用 `--timeout 120` 限制等待时间，默认一直等待。`pay` 使用 Fiber 默认费用预算（当前为金额的 0.5%，向上取整到 shannon），不提供费用参数，默认等待 120 秒；trampoline 可能花费完整费用预算。两条命令仅接受 `-u N` 当前轮次，不提供 `--account` 和 `--round` 参数。默认使用账户保存的 RPC 地址和用户 token，不需要配置文件。

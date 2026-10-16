@@ -181,7 +181,7 @@ pub async fn pay(options: PayOptions) -> Result<()> {
     let client = crate::ClientOptions::from(options.client);
     let (dir, _selection) =
         crate::accounts::choose(&crate::accounts::root(), &client, false, false, false)?;
-    let config = Connection::connect(&client.connection, &dir)?;
+    let config = Connection::connect(&client.connection)?;
     let mut account = ClientAccount::load_dir(&config, dir).await?;
     account.session = account.session.with_policy(SigningPolicy::Manual);
     let rpc = Rpc::new(&config.rpc_url)?;
@@ -239,7 +239,7 @@ pub async fn create_invoice(options: InvoiceOptions) -> Result<()> {
     let client = crate::ClientOptions::from(options.client);
     let (dir, _selection) =
         crate::accounts::choose(&crate::accounts::root(), &client, false, false, false)?;
-    let config = Connection::connect(&client.connection, &dir)?;
+    let config = Connection::connect(&client.connection)?;
     let mut account = ClientAccount::load_dir(&config, dir).await?;
     account.session = account.session.with_policy(SigningPolicy::Manual);
     let rpc = Rpc::new(&config.rpc_url)?;

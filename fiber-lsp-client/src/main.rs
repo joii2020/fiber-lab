@@ -62,9 +62,9 @@ struct Selector {
 
 #[derive(Args, Default, Clone)]
 struct ConnectionOptions {
-    /// LSP RPC 地址；已有账户默认复用保存的地址
+    /// LSP RPC 地址（每次调用必须指定）
     #[arg(long, value_name = "URL")]
-    rpc_url: Option<String>,
+    rpc_url: String,
     /// 覆盖默认管理凭证；仅首次注册或开通时使用
     #[arg(long, value_name = "TOKEN", conflicts_with = "token_file")]
     token: Option<String>,
@@ -210,7 +210,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Status(options) => {
             let (dir, _selection) =
                 accounts::choose(&accounts::root(), &options, false, true, false)?;
-            let config = rpc::Connection::connect(&options.connection, &dir)?;
+            let config = rpc::Connection::connect(&options.connection)?;
             account::verify_local(&dir, &config).await?;
             let local: serde_json::Value = dir.read_json()?;
             println!("本地注册阶段：{}", local["registration"]);

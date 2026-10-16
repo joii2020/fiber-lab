@@ -1,15 +1,20 @@
 use super::*;
+
+fn parse_with_url<const N: usize>(args: [&str; N]) -> Result<Cli, clap::Error> {
+    let mut args = args.to_vec();
+    args.extend(["--rpc-url", "http://127.0.0.1:21716"]);
+    Cli::try_parse_from(args)
+}
+
 #[test]
 fn user_selection_is_required_exclusive_and_bounded() {
     for command in ["status", "create-channel", "close-channel"] {
-        assert!(Cli::try_parse_from(["lsp-cli", command]).is_err());
+        assert!(parse_with_url(["lsp-cli", command]).is_err());
         for user in ["0", "5"] {
-            assert!(Cli::try_parse_from(["lsp-cli", command, "-u", user]).is_err());
+            assert!(parse_with_url(["lsp-cli", command, "-u", user]).is_err());
         }
-        assert!(
-            Cli::try_parse_from(["lsp-cli", command, "-u", "1", "--account", "default"]).is_err()
-        );
-        assert!(Cli::try_parse_from(["lsp-cli", command, "-u", "4"]).is_ok());
+        assert!(parse_with_url(["lsp-cli", command, "-u", "1", "--account", "default"]).is_err());
+        assert!(parse_with_url(["lsp-cli", command, "-u", "4"]).is_ok());
     }
     for old in [
         "watch",
@@ -22,7 +27,7 @@ fn user_selection_is_required_exclusive_and_bounded() {
         "archive-account",
         "list-accounts",
     ] {
-        assert!(Cli::try_parse_from(["lsp-cli", old]).is_err());
+        assert!(parse_with_url(["lsp-cli", old]).is_err());
     }
     assert!(Cli::try_parse_from(["lsp-cli", "accounts", "--history"]).is_ok());
     assert!(Cli::try_parse_from(["lsp-cli", "admin", "init-accounts"]).is_ok());
@@ -30,7 +35,7 @@ fn user_selection_is_required_exclusive_and_bounded() {
 #[test]
 fn restored_funding_amount_stays_optional() {
     let Some(Command::CreateChannel(options)) =
-        Cli::try_parse_from(["lsp-cli", "create-channel", "-u", "1"])
+        parse_with_url(["lsp-cli", "create-channel", "-u", "1"])
             .unwrap()
             .command
     else {
@@ -41,17 +46,16 @@ fn restored_funding_amount_stays_optional() {
 #[test]
 fn historical_round_requires_fixed_account_and_recovery_preserves_round() {
     for command in ["status", "close-channel"] {
-        assert!(Cli::try_parse_from(["lsp-cli", command, "--round", "1"]).is_err());
-        assert!(Cli::try_parse_from(["lsp-cli", command, "-u", "1", "--round", "0"]).is_err());
+        assert!(parse_with_url(["lsp-cli", command, "--round", "1"]).is_err());
+        assert!(parse_with_url(["lsp-cli", command, "-u", "1", "--round", "0"]).is_err());
         assert!(
-            Cli::try_parse_from(["lsp-cli", command, "--account", "default", "--round", "1"])
-                .is_err()
+            parse_with_url(["lsp-cli", command, "--account", "default", "--round", "1"]).is_err()
         );
-        assert!(Cli::try_parse_from(["lsp-cli", command, "-u", "1", "--round", "1"]).is_ok());
+        assert!(parse_with_url(["lsp-cli", command, "-u", "1", "--round", "1"]).is_ok());
     }
-    assert!(Cli::try_parse_from(["lsp-cli", "create-channel", "-u", "1", "--round", "1"]).is_err());
+    assert!(parse_with_url(["lsp-cli", "create-channel", "-u", "1", "--round", "1"]).is_err());
     let Some(Command::Status(options)) =
-        Cli::try_parse_from(["lsp-cli", "status", "-u", "2", "--round", "3"])
+        parse_with_url(["lsp-cli", "status", "-u", "2", "--round", "3"])
             .unwrap()
             .command
     else {
@@ -70,6 +74,10 @@ fn connection_arguments_accept_url_and_token_without_server_config() {
         vec!["lsp-cli", "pay", "invoice", "-u", "1"],
         vec!["lsp-cli", "create-invoice", "--amount", "1", "-u", "1"],
     ] {
+        assert!(Cli::try_parse_from(&args).is_err());
+        let mut url_args = args.clone();
+        url_args.extend(["--rpc-url", "https://lsp.example/rpc"]);
+        assert!(Cli::try_parse_from(url_args).is_ok());
         let mut token_args = args.clone();
         token_args.extend([
             "--rpc-url",

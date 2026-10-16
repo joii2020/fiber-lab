@@ -21,16 +21,16 @@
 ```bash
 ./lsp-cli admin init-accounts
 ./lsp-cli create-channel --funding-amount 1000 -u 1 --rpc-url http://127.0.0.1:21716
-./lsp-cli status -u 1
+./lsp-cli status -u 1 --rpc-url http://127.0.0.1:21716
 ```
 
 开通使用已有账户及 LSP 公钥，从本地普通 Node1 读取钱包链与合约部署，通过 LSP 的 `node_info` 查询出资条款并核对链一致，用户 1～4 分别从 offckb #6～#9 出资（示例用户 1 为 #6），LSP / Public T 从 #5 出资。示例中本方 1000 CKB（含 100 CKB 保留金额：99 CKB 占用容量和 1 CKB 关闭手续费）、新初始化环境对方默认 1000 CKB，通道总出资为 2000 CKB 加实际交易费，#6 无需承担对方注入额。钱包核验双方 inputs、各自找零、合约、实际扣款和费用后，仅签名 #6 的 inputs，SDK 核验开通条款和初始 commitment；最终等待链上出资确认及 `ChannelReady`。
 
-`status` 同时展示账户信息和当前账户的通道、余额、出资 / 关闭 hash 和待恢复阶段；查询不提交任何签名。中断后 `./lsp-cli create-channel -u 1` 核对并恢复原意图，不改变身份或重复出资。
+`status` 同时展示账户信息和当前账户的通道、余额、出资 / 关闭 hash 和待恢复阶段；查询不提交任何签名。中断后 `./lsp-cli create-channel -u 1 --rpc-url http://127.0.0.1:21716` 核对并恢复原意图，不改变身份或重复出资。
 
 ```bash
-./lsp-cli close-channel -u 1
-./lsp-cli status -u 1
+./lsp-cli close-channel -u 1 --rpc-url http://127.0.0.1:21716
+./lsp-cli status -u 1 --rpc-url http://127.0.0.1:21716
 ```
 
 协作关闭要求本地已验证余额一致且没有未结算 TLC，退款使用开通时绑定的双方钱包脚本，新通道本方退回所选用户的 #6～#9、对方退回 #5；旧版共用 #5 的通道继续按原脚本核对。关闭费在本地独立计算，由发起方承担；只有关闭交易链上确认且退款匹配才报告成功。中断后重复 `close-channel` 继续原操作。当前同租户关闭后再开通受服务端 / SDK 单通道记录限制，旧记录保留。命令、金额及出资条件见 [README](../README.md#6-四用户与通道)。
@@ -41,9 +41,9 @@
 
 ```bash
 # 终端 A：创建后直接在线等待
-./lsp-cli create-invoice -u 1 --amount 1 --expiry 3600
+./lsp-cli create-invoice -u 1 --amount 1 --expiry 3600 --rpc-url http://127.0.0.1:21716
 # 终端 B：复制 A 输出的完整地址
-./lsp-cli pay -u 2 '<invoice_address>' --timeout 120
+./lsp-cli pay -u 2 '<invoice_address>' --timeout 120 --rpc-url http://127.0.0.1:21716
 ```
 
 双方需提前准备到 LSP 的私有通道及对应方向流动性。CLI 仅处理 devnet 固定金额 CKB 发票，使用单笔 trampoline 付款（max_parts=1）。RPC 不传 max_fee_amount 和 max_fee_rate，使用 Fiber 默认费用预算。SDK 的精确 TLC 授权按同级 Fiber 当前默认规则计算：ceil(金额 × 5 / 1000) shannons；付款 TLC 授权金额为发票金额加该预算。

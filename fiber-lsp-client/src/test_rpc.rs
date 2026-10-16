@@ -61,39 +61,31 @@ fn connection_initialization_needs_only_a_url_and_keeps_accounts_local() {
 #[test]
 fn fresh_connection_uses_only_url_and_explicit_token() {
     let root = tempfile::tempdir().unwrap();
-    let dir = crate::store::AccountDir::lock(&root.path().join("account")).unwrap();
-    assert!(
-        Connection::connect(&crate::ConnectionOptions::default(), &dir)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("--rpc-url")
-    );
     for url in [
         "file:///tmp/lsp",
         "http://user:secret@localhost",
         "not-a-url",
     ] {
         let options = crate::ConnectionOptions {
-            rpc_url: Some(url.into()),
+            rpc_url: url.into(),
             ..Default::default()
         };
-        assert!(Connection::connect(&options, &dir).is_err());
+        assert!(Connection::connect(&options).is_err());
     }
     let path = root.path().join("registration-token");
     fs::write(&path, "  bootstrap-secret\n").unwrap();
     let options = crate::ConnectionOptions {
-        rpc_url: Some("https://lsp.example/rpc".into()),
+        rpc_url: "https://lsp.example/rpc".into(),
         token_file: Some(path),
         ..Default::default()
     };
-    let connection = Connection::connect(&options, &dir).unwrap();
+    let connection = Connection::connect(&options).unwrap();
     assert_eq!(connection.rpc_url, "https://lsp.example/rpc");
     assert_eq!(
         connection.registration_token().unwrap().as_str(),
         "bootstrap-secret"
     );
-    assert!(!dir.is_initialized().unwrap());
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
     let empty = crate::ConnectionOptions {
         token: Some("  ".into()),
         ..Default::default()

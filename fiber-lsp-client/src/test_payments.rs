@@ -220,15 +220,19 @@ fn online_commands_only_accept_current_user_selection() {
 #[test]
 fn cli_uses_fiber_defaults_and_always_receives_online() {
     use clap::Parser;
-    assert!(crate::Cli::try_parse_from(["lsp-cli", "pay", "invoice"]).is_err());
-    assert!(crate::Cli::try_parse_from(["lsp-cli", "pay", "invoice", "-u", "1"]).is_ok());
+    let parse = |args: &[&str]| {
+        crate::Cli::try_parse_from(
+            args.iter()
+                .copied()
+                .chain(["--rpc-url", "http://127.0.0.1:21716"]),
+        )
+    };
+    assert!(parse(&["lsp-cli", "pay", "invoice"]).is_err());
+    assert!(parse(&["lsp-cli", "pay", "invoice", "-u", "1"]).is_ok());
+    assert!(parse(&["lsp-cli", "pay", "invoice", "--max-fee", "0.01", "-u", "1"]).is_err());
+    assert!(parse(&["lsp-cli", "create-invoice"]).is_err());
     assert!(
-        crate::Cli::try_parse_from(["lsp-cli", "pay", "invoice", "--max-fee", "0.01", "-u", "1"])
-            .is_err()
-    );
-    assert!(crate::Cli::try_parse_from(["lsp-cli", "create-invoice"]).is_err());
-    assert!(
-        crate::Cli::try_parse_from([
+        parse(&[
             "lsp-cli",
             "create-invoice",
             "--amount",
@@ -241,7 +245,7 @@ fn cli_uses_fiber_defaults_and_always_receives_online() {
         .is_ok()
     );
     assert!(
-        crate::Cli::try_parse_from([
+        parse(&[
             "lsp-cli",
             "create-invoice",
             "--amount",

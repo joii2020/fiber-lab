@@ -66,21 +66,12 @@ impl Connection {
         })
     }
 
-    pub fn connect(
-        options: &crate::ConnectionOptions,
-        dir: &crate::store::AccountDir,
-    ) -> Result<Self> {
-        let saved: Option<Value> = if dir.is_initialized()? {
-            Some(dir.read_json()?)
-        } else {
-            None
-        };
-        let rpc_url = options
-            .rpc_url
-            .clone()
-            .or_else(|| saved.as_ref()?.get("rpc_url")?.as_str().map(str::to_owned))
-            .context("首次接入必须指定 --rpc-url")?;
-        Self::new(crate::accounts::root(), rpc_url, options.read_token()?)
+    pub fn connect(options: &crate::ConnectionOptions) -> Result<Self> {
+        Self::new(
+            crate::accounts::root(),
+            options.rpc_url.clone(),
+            options.read_token()?,
+        )
     }
 
     /// Read the bootstrap credential only when registration or initial opening needs it.

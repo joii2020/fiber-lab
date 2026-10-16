@@ -325,8 +325,11 @@ async fn saved_account_connects_without_config_or_bootstrap_token_and_accepts_le
     account.dir.save_json(&legacy).unwrap();
     fs::remove_file(config.root.join("configs/keys/operator-token")).unwrap();
     let before = fs::read(account.dir.path.join("account.json")).unwrap();
-    let mut connection =
-        Connection::connect(&crate::ConnectionOptions::default(), &account.dir).unwrap();
+    let mut connection = Connection::connect(&crate::ConnectionOptions {
+        rpc_url: config.rpc_url.clone(),
+        ..Default::default()
+    })
+    .unwrap();
     assert_eq!(connection.rpc_url, config.rpc_url);
     assert!(connection.registration_token.is_none());
     connection.root = config.root.clone();
@@ -356,10 +359,10 @@ async fn explicit_rpc_override_cannot_rebind_a_saved_account() {
     let account = test_registered(&config).await;
     let before = fs::read(account.dir.path.join("account.json")).unwrap();
     let options = crate::ConnectionOptions {
-        rpc_url: Some("https://another-lsp.example/rpc".into()),
+        rpc_url: "https://another-lsp.example/rpc".into(),
         ..Default::default()
     };
-    let mut connection = Connection::connect(&options, &account.dir).unwrap();
+    let mut connection = Connection::connect(&options).unwrap();
     connection.root = config.root.clone();
     assert!(
         restore(&account.dir, &connection)

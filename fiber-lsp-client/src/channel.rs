@@ -231,7 +231,7 @@ pub async fn open(options: OpenOptions) -> Result<()> {
         "用户钱包公开绑定不一致；未分配身份或注册"
     );
     let (dir, selection) = crate::accounts::choose(&root, &client, true, false, true)?;
-    let config = Connection::connect(&options.connection, &dir)?;
+    let config = Connection::connect(&options.connection)?;
     let binding = selection.funding.as_ref().unwrap();
     ensure!(
         original_binding == *binding,
@@ -322,7 +322,7 @@ async fn open_engine(
                 amount(u128::from(funding))
             );
         }
-        let connection = Connection::connect(&options.connection, &account.dir)?;
+        let connection = Connection::connect(&options.connection)?;
         let bootstrap = connection.registration_token()?;
         let node: fiber_json_types::NodeInfoResult =
             rpc.call("node_info", json!([]), &bootstrap).await?;
@@ -676,7 +676,7 @@ pub async fn close(options: CloseOptions) -> Result<()> {
     };
     let root = crate::accounts::root();
     let (dir, selection) = crate::accounts::choose(&root, &client, false, true, false)?;
-    let config = Connection::connect(&options.connection, &dir)?;
+    let config = Connection::connect(&options.connection)?;
     crate::accounts::check_historical_close(&config.root, &selection)?;
     let local: serde_json::Value = dir.read_json()?;
     if local["registration"] != "registered" && read_intent(&dir)?.is_none() {
