@@ -67,20 +67,13 @@ async fn lsp(options: &Options) -> Result<Value> {
     let seconds = options.timeout.to_string();
     let mut receiver = cli(
         options,
-        &[
-            "create-invoice",
-            "--amount",
-            "1",
-            "--wait",
-            "--timeout",
-            &seconds,
-        ],
+        &["create-invoice", "--amount", "1", "--timeout", &seconds],
         &options.receiver,
     )?;
     let mut lines = BufReader::new(receiver.stdout.take().context("missing stdout")?).lines();
     let mut invoice = None;
     let mut hash = None;
-    // Never save these lines: invoice/preimage/recovery output is not benchmark data.
+    // Never save these lines: invoice output is not benchmark data.
     while invoice.is_none() || hash.is_none() {
         let line = lines
             .next_line()
@@ -97,14 +90,7 @@ async fn lsp(options: &Options) -> Result<Value> {
     let start = Instant::now();
     let payer = cli(
         options,
-        &[
-            "pay",
-            invoice.as_deref().unwrap(),
-            "--max-fee",
-            "0.01",
-            "--timeout",
-            &seconds,
-        ],
+        &["pay", invoice.as_deref().unwrap(), "--timeout", &seconds],
         &options.payer,
     )?;
     let payer_future = async {
@@ -180,13 +166,7 @@ async fn normal(options: &Options) -> Result<Value> {
         .as_str()
         .context("missing_invoice")?;
     let start = Instant::now();
-    let sent = rpc(
-        &client,
-        payer,
-        "send_payment",
-        json!({"invoice":invoice,"max_fee_amount":"0xf4240"}),
-    )
-    .await?;
+    let sent = rpc(&client, payer, "send_payment", json!({"invoice":invoice})).await?;
     let send_us = start.elapsed().as_micros();
     let hash = sent["payment_hash"].as_str().context("missing_hash")?;
     let mut released = !options.hold;
@@ -263,10 +243,10 @@ async fn main() -> Result<()> {
         output.flush()?;
         if record["success"] != true {
             failures += usize::from(!warmup);
-            // A new invoice after an unknown outcome would obscure recovery and liquidity.
+            // A new invoice after an unknown outcome would obscure the result and liquidity.
             // Preserve the failed attempt and stop instead of issuing another payment.
             bail!(
-                "attempt {attempt} incomplete; measured failures: {failures}; recover its original hash before continuing; result saved"
+                "attempt {attempt} incomplete; measured failures: {failures}; check its outcome before continuing; result saved"
             );
         }
         if !warmup {

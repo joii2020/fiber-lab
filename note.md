@@ -96,44 +96,22 @@ tail -f .state/devnet/lsp.log
 终端 A：账户 1 创建 1 CKB 发票，有效期 3600 秒。复制输出中的完整 `invoice_address`，保持命令运行，等待收款完成：
 
 ```bash
-./lsp-cli create-invoice -u 1 --amount 1 --expiry 3600 --wait
+./lsp-cli create-invoice -u 1 --amount 1 --expiry 3600
 ```
 
-终端 B：将 `<invoice_address>` 替换为上面的完整发票地址，由账户 2 支付，费用上限为 0.01 CKB：
+终端 B：将 `<invoice_address>` 替换为上面的完整发票地址，由账户 2 支付，使用 Fiber 默认费用预算（1 CKB 对应 0.005 CKB）：
 
 ```bash
-./lsp-cli pay -u 2 '<invoice_address>' --max-fee 0.01 --timeout 120
+./lsp-cli pay -u 2 '<invoice_address>' --timeout 120
 ```
 
-双方命令结束后，查看余额和收付款记录：
+双方命令结束后，查看余额：
 
 ```bash
 ./lsp-cli status -u 1
 ./lsp-cli status -u 2
-./lsp-cli list-payments -u 1
-./lsp-cli list-payments -u 2
 ```
 
-将 `<payment_hash>` 替换为本笔收付款的实际 hash，分别查询发票和付款状态：
+创建发票后默认保持在线，双方都需持续运行到完成。当前只处理本次单笔收付款，不提供离线或中断恢复；业务状态仅保存在进程内存中，不读写 payments.json。超时或 Ctrl-C 不取消网络付款，不要直接重复付款。
 
-```bash
-./lsp-cli invoice-status -u 1 --payment-hash '<payment_hash>'
-./lsp-cli payment-status -u 2 --payment-hash '<payment_hash>'
-```
-
-只生成发票并退出时，省略 `--wait`。对端付款时，收款账户仍需运行 `resume` 或 `watch` 推进收款：
-
-```bash
-./lsp-cli create-invoice -u 1 --amount 1 --expiry 3600
-./lsp-cli resume -u 1 --payment-hash '<payment_hash>' --timeout 120
-# 或持续处理本账户已有的收付款，Ctrl-C 退出
-./lsp-cli watch -u 1
-```
-
-付款等待超时或中断后，使用原 hash 恢复：
-
-```bash
-./lsp-cli resume -u 2 --payment-hash '<payment_hash>' --timeout 120
-```
-
-超时或 Ctrl-C 只停止本次等待，不取消付款或发票；保留原 hash 和数据，先恢复、查询，不要重复付款。同一账户一次只能运行一个命令，查询前需先退出该账户的 `--wait`、`resume` 或 `watch`；双方都需保持各自的收付款推进命令运行，直至完成。
+完整用法见 [README](README.md#7-双方在线的-1v1-收付款)。

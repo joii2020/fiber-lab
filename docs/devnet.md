@@ -62,7 +62,7 @@
 | `.state/devnet/` | LSP 日志和 PID |
 | `configs/keys/operator-token` | 管理凭证 |
 | `.state/fiber-lsp-client/accounts.json` | 四用户固定钱包、当前轮次与永久历史归属 |
-| `.state/fiber-lsp-client/accounts/<ID>/` | 各轮身份、租户凭证、SDK 与通道/收付款恢复资料 |
+| `.state/fiber-lsp-client/accounts/<ID>/` | 各轮身份、租户凭证、SDK 与通道恢复资料；已有旧付款文件保留 |
 | `.state/fiber-lsp-client/default/` | 旧版历史账户；升级不移动 |
 
 客户端默认直接读取 offckb Node3 的 `config.yml`，也可用 `--config PATH` 指定配置。`configs/keys/` 和 `.state/` 已加入 Git 忽略规则，由使用者在本地生成。

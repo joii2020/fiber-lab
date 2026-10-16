@@ -38,20 +38,10 @@ enum Command {
     CreateChannel(channel::OpenOptions),
     /// 协作关闭当前账户通道并核对链上退款
     CloseChannel(channel::CloseOptions),
-    /// 按原授权付款并等待结算（金额及费用单位 CKB）
+    /// 在线支付一张发票并等待结算（金额及费用单位 CKB）
     Pay(payments::PayOptions),
-    /// 创建 hold invoice；默认输出后退出，--wait 在线收款
+    /// 创建发票并保持在线，等待一笔收款完成
     CreateInvoice(payments::InvoiceOptions),
-    /// 前台推进当前账户已有收付款授权
-    Watch(ClientOptions),
-    /// 按原付款 hash 有界恢复收付款
-    Resume(payments::ResumeOptions),
-    /// 只读核对本地及远端付款状态
-    PaymentStatus(payments::HashOptions),
-    /// 只读核对本地及远端发票状态
-    InvoiceStatus(payments::HashOptions),
-    /// 只读列出本地收付款记录
-    ListPayments(ClientOptions),
     /// 离线列出四个固定账户；--history 同时显示各账户历轮及旧身份
     Accounts {
         #[arg(long)]
@@ -68,6 +58,28 @@ struct Selector {
     /// 兼容旧数据的内部身份 ID；日常历史操作使用 -u N --round R
     #[arg(long, value_name = "ID")]
     account: Option<String>,
+}
+
+#[derive(Args)]
+struct CurrentClientOptions {
+    /// 固定账户编号 1～4（当前轮次）
+    #[arg(short = 'u', long, value_parser = clap::value_parser!(u8).range(1..=4))]
+    user: u8,
+    /// Node3 配置路径
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+}
+impl From<CurrentClientOptions> for ClientOptions {
+    fn from(options: CurrentClientOptions) -> Self {
+        Self {
+            selector: Selector {
+                user: Some(options.user),
+                account: None,
+            },
+            round: None,
+            config: options.config,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -163,11 +175,6 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Accounts { history } => accounts::list(&accounts::root(), history)?,
         Command::Pay(options) => payments::pay(options).await?,
         Command::CreateInvoice(options) => payments::create_invoice(options).await?,
-        Command::Watch(options) => payments::watch(options).await?,
-        Command::Resume(options) => payments::resume(options).await?,
-        Command::PaymentStatus(options) => payments::status(options, false).await?,
-        Command::InvoiceStatus(options) => payments::status(options, true).await?,
-        Command::ListPayments(options) => payments::list(options).await?,
         Command::CreateChannel(options) => channel::open(options).await?,
         Command::CloseChannel(options) => channel::close(options).await?,
         Command::Status(options) => {
@@ -196,71 +203,5 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn user_selection_is_required_exclusive_and_bounded() {
-        for command in [
-            "status",
-            "create-channel",
-            "close-channel",
-            "watch",
-            "list-payments",
-        ] {
-            assert!(Cli::try_parse_from(["lsp-cli", command]).is_err());
-            for user in ["0", "5"] {
-                assert!(Cli::try_parse_from(["lsp-cli", command, "-u", user]).is_err());
-            }
-            assert!(
-                Cli::try_parse_from(["lsp-cli", command, "-u", "1", "--account", "default"])
-                    .is_err()
-            );
-            assert!(Cli::try_parse_from(["lsp-cli", command, "-u", "4"]).is_ok());
-        }
-        for old in [
-            "create-user",
-            "open-channel",
-            "archive-account",
-            "list-accounts",
-        ] {
-            assert!(Cli::try_parse_from(["lsp-cli", old]).is_err());
-        }
-        assert!(Cli::try_parse_from(["lsp-cli", "accounts", "--history"]).is_ok());
-        assert!(Cli::try_parse_from(["lsp-cli", "admin", "init-accounts"]).is_ok());
-    }
-    #[test]
-    fn restored_funding_amount_stays_optional() {
-        let Some(Command::CreateChannel(options)) =
-            Cli::try_parse_from(["lsp-cli", "create-channel", "-u", "1"])
-                .unwrap()
-                .command
-        else {
-            panic!()
-        };
-        assert!(options.funding_amount.is_none());
-    }
-    #[test]
-    fn historical_round_requires_fixed_account_and_recovery_preserves_round() {
-        for command in ["status", "close-channel", "list-payments"] {
-            assert!(Cli::try_parse_from(["lsp-cli", command, "--round", "1"]).is_err());
-            assert!(Cli::try_parse_from(["lsp-cli", command, "-u", "1", "--round", "0"]).is_err());
-            assert!(
-                Cli::try_parse_from(["lsp-cli", command, "--account", "default", "--round", "1"])
-                    .is_err()
-            );
-            assert!(Cli::try_parse_from(["lsp-cli", command, "-u", "1", "--round", "1"]).is_ok());
-        }
-        assert!(
-            Cli::try_parse_from(["lsp-cli", "create-channel", "-u", "1", "--round", "1"]).is_err()
-        );
-        let Some(Command::Status(options)) =
-            Cli::try_parse_from(["lsp-cli", "status", "-u", "2", "--round", "3"])
-                .unwrap()
-                .command
-        else {
-            panic!()
-        };
-        assert_eq!(options.recovery_selector(), "-u 2 --round 3");
-        assert!(options.current_only().is_err());
-    }
-}
+#[path = "test_main.rs"]
+mod tests;

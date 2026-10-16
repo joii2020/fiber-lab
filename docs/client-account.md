@@ -26,12 +26,12 @@
 
 `accounts` 离线只读展示四用户和本地状态，不要求配置、节点或 offckb 可用；`--history` 显示历轮和旧未绑定账户。本地 Ready 不代表实时可用，`status -u N` 再核对远端及链上；初始化未注册时 status 展示本地状态而不注册，空闲时读取最近关闭摘要。查询不写回清单或 SDK。
 
-所有日常命令必须选择固定账户 `-u N`。status、close-channel、resume、payment-status、invoice-status、list-payments 支持 `-u N --round R` 历史入口；pay、create-invoice、watch、create-channel 只处理当前轮次。轮次按清单内该账户身份的创建顺序从 1 编号，包括当前轮次；只有已归档轮次允许用 `--round`，当前轮次直接用 `-u N`。历史查询使用该轮原凭证和 signer，不切换当前指针、不跨账户查 hash；历史归档重试不影响已创建的新轮次。兼容旧数据的 `--account ID` 入口仍保留，与 `-u N`、`--round R` 互斥，旧未绑定身份继续用此入口。
+所有日常命令必须选择固定账户 `-u N`。status、close-channel 支持 `-u N --round R` 历史入口；pay、create-invoice、create-channel 只处理当前轮次。轮次按清单内该账户身份的创建顺序从 1 编号，包括当前轮次；只有已归档轮次允许用 `--round`，当前轮次直接用 `-u N`。历史查询使用该轮原凭证和 signer，不切换当前指针、不跨账户查 hash；历史归档重试不影响已创建的新轮次。兼容旧数据的 `--account ID` 入口仍保留，与 `-u N`、`--round R` 互斥，旧未绑定身份继续用此入口。
 
 `accounts` 展示固定账户、钱包、tenant_id、本地状态和历史数，不展示内部时间戳 ID 或当前轮次。`accounts --history` 展示各账户轮次及状态；旧未绑定身份仍展示 ID 以便恢复。历史直接存储于 `.state/fiber-lsp-client/`，清单关联账户与历轮，沿用原身份目录和 v2 格式，无需搬迁已有数据。
 
 锁顺序为用户锁 → 短清单锁 → 账户锁，清单锁不跨 RPC。关闭核验后释放账户锁，保持用户锁，再按清单锁 → 账户锁归档。锁非阻塞，竞争明确报错；新开通另持全局开通锁，避免共享 LSP #5 cell 冲突。
 
-v1 查询保留原格式和数据，不自动迁移；只有 init-accounts 升级为 v2，旧账户的 user 为 null，原 current 仅作为 legacy_current 展示。新账户目录是 `.state/fiber-lsp-client/accounts/<ID>/`，旧 default 目录不移动。root-key、signer.bin、account.json、channel.json 和 payments.json 必须一起保留，私密文件为 600。
+v1 查询保留原格式和数据，不自动迁移；只有 init-accounts 升级为 v2，旧账户的 user 为 null，原 current 仅作为 legacy_current 展示。新账户目录是 `.state/fiber-lsp-client/accounts/<ID>/`，旧 default 目录不移动。root-key、signer.bin、account.json 和 channel.json 必须一起保留，私密文件为 600。旧 payments.json 保留，当前收付款流程不再读取或写入该文件。
 
-收付款和离线边界见 [付款流程](payment-flow.md)。
+双方在线的收付款流程见 [付款流程](payment-flow.md)。

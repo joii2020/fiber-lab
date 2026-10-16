@@ -63,17 +63,7 @@ fn explicit_config_is_relative_to_cwd_and_needs_no_home() {
 
 #[test]
 fn lifecycle_help_and_amount_validation_need_no_configuration() {
-    for name in [
-        "create-channel",
-        "close-channel",
-        "pay",
-        "create-invoice",
-        "watch",
-        "resume",
-        "payment-status",
-        "invoice-status",
-        "list-payments",
-    ] {
+    for name in ["create-channel", "close-channel", "pay", "create-invoice"] {
         let output = Command::new(env!("CARGO_BIN_EXE_fiber-lsp-client"))
             .args([name, "--help"])
             .env_remove("HOME")
@@ -83,6 +73,11 @@ fn lifecycle_help_and_amount_validation_need_no_configuration() {
         assert!(output.status.success());
     }
     for name in [
+        "watch",
+        "resume",
+        "payment-status",
+        "invoice-status",
+        "list-payments",
         "openchannel",
         "closechannel",
         "closeChannel",

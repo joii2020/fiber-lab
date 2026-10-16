@@ -1,6 +1,6 @@
 # 通道与收付款流程
 
-开通道、独立查询、协作关闭及收付款恢复命令已实现。四用户开关、退款和下一轮，以及 U3 / U4 双向在线收付款已通过实际 devnet 验证；离线和故障恢复仍需单独验证。在线出款依赖当前同级 Fiber 工作区已有的提前原像查询修改；旧版本曾在 TLC 移除签名前缺少 resolution 证据而拒签。验证结果及双终端命令见 [快速开始](../README.md#7-收付款及离线恢复)。
+当前收付款范围为双方在线的 1v1 场景；通道开通、查询和协作关闭继续保留。双终端命令见 [快速开始](../README.md#7-双方在线的-1v1-收付款)。
 
 ## 联调路径与余额
 
@@ -35,72 +35,43 @@
 
 协作关闭要求本地已验证余额一致且没有未结算 TLC，退款使用开通时绑定的双方钱包脚本，新通道本方退回所选用户的 #6～#9、对方退回 #5；旧版共用 #5 的通道继续按原脚本核对。关闭费在本地独立计算，由发起方承担；只有关闭交易链上确认且退款匹配才报告成功。中断后重复 `close-channel` 继续原操作。当前同租户关闭后再开通受服务端 / SDK 单通道记录限制，旧记录保留。命令、金额及出资条件见 [README](../README.md#6-四用户与通道)。
 
-## 付款：接收对端发票
+## 双方在线的单笔收付款
 
-普通节点 `new_invoice` 创建有签名的 devnet 固定金额 CKB 发票，例如 amount 为 `0x5f5e100`（1 CKB），currency 为 `Fibd`，expiry 为 `0xe10`（3600 秒）。交给客户端：
-
-```bash
-./lsp-cli pay '<普通节点 invoice_address>' --max-fee 0.01 --timeout 120 -u 1
-```
-
-客户端本地解析并核验签名、网络、金额、资产和有效期，通过已绑定私有通道到 Public T 的 trampoline 付款；`max_parts=1`。trampoline 可能花费完整的费用预算，因此 SDK 授权的通道 TLC 金额是发票金额加原费用预算，而不只是发票金额。第一次付款显式传入 `--max-fee`，恢复保持原金额和费用，不改变路由授权。
-
-发送前保存意图和 SDK 授权，落盘“可能已发送”后调用 `send_payment`。网络或响应失败后 `resume` 只查询原 hash，不自动重发，即使远端当前返回不存在也保留未知结果。服务端 `Failed` 后只核对 TLC 清理及退款，不自动新尝试。
-
-`Success` 不是单独的完成依据：须核验正确 preimage、SDK 双 lane 中原 TLC 的接受及移除、最新余额和远端余额。状态尚未同步时显示远端成功、待本地核对。
-
-## 创建发票：默认退出或在线等待
+当前仅支持 A 创建发票、B 付款，双方保持在线直到结算完成。每次命令只推进当前一笔操作；不创建或发送其他历史意图，不提供 watch、resume 或收付款查询命令。
 
 ```bash
-./lsp-cli create-invoice --amount 1 --expiry 3600 -u 1
-./lsp-cli create-invoice --amount 1 --expiry 3600 --wait -u 1
-./lsp-cli create-invoice --amount 1 --expiry 3600 --wait --timeout 120 -u 1
+# 终端 A：创建后直接在线等待
+./lsp-cli create-invoice -u 1 --amount 1 --expiry 3600
+# 终端 B：复制 A 输出的完整地址
+./lsp-cli pay -u 2 '<invoice_address>' --timeout 120
 ```
 
-首次显式指定金额；expiry 默认 3600 秒。客户端先生成并保存秘密和 SDK 授权，调用 `new_invoice` 时只提供 payment hash，生成 hold invoice。核对地址、hash、金额、有效期、算法、租户发票公钥及 Public T 路由提示，再保存、输出并刷新 stdout。
+双方需提前准备到 LSP 的私有通道及对应方向流动性。CLI 仅处理 devnet 固定金额 CKB 发票，使用单笔 trampoline 付款（max_parts=1）。RPC 不传 max_fee_amount 和 max_fee_rate，使用 Fiber 默认费用预算。SDK 的精确 TLC 授权按同级 Fiber 当前默认规则计算：ceil(金额 × 5 / 1000) shannons；付款 TLC 授权金额为发票金额加该预算。
 
-默认输出后退出；不启动后台进程。`--wait` 输出后保持前台，使用与 `watch` 相同的签名与安全结算逻辑；无需另外启动 watch。带 `--wait` 时默认持续等待，可用 `--timeout` 限制本次等待。创建响应丢失后按原 hash 查询，明确不存在时复用原秘密和 hash 创建，无法区分的错误不能被当作不存在。
+### 收款
 
-## 离线及中断恢复
+客户端在内存中生成 preimage、payment hash 和本地授权，使用 hash 创建 hold invoice，核对发票签名、金额、算法、有效期、租户发票公钥和 LSP 路由提示。输出并刷新 invoice_address 后持续推进本次收款。
 
-```bash
-./lsp-cli resume --payment-hash 0x... --timeout 120 -u 1
-./lsp-cli watch -u 1
-./lsp-cli payment-status --payment-hash 0x... -u 1
-./lsp-cli invoice-status --payment-hash 0x... -u 1
-./lsp-cli list-payments -u 1
-```
+当发票为 Received，且 SDK 最新本地 commitment 包含该 TLC 并有完整恢复签名时，通过 SDK 检查 funding 仍 live 及安全窗口，再调用 settle_invoice 释放秘密。每次释放尝试均重新检查，额外保留 30 秒 RPC 预算。
 
-所有命令支持 `--config PATH`，日常操作必选 `-u N`。仅 resume、payment-status、invoice-status、list-payments 支持互斥 `--account ID` 历史入口；pay、create-invoice、watch 只处理用户当前轮次，用户空闲时不会回退历史。账户归档保留 `payments.json`、SDK store、密钥和秘密。`resume` 有界推进原操作；watch 前台持续推进全部原授权。同通道的签名可能同时涉及其他原授权操作。
+create-invoice 默认一直等待，不再提供 --wait；--timeout 可限制本次等待时间。
 
-默认离线演示：创建发票 → CLI 输出后退出（停止同账户其他推进进程）→ 对端付款 → 有效窗口内 resume 或 watch 上线 → 签名、安全释放秘密、核对入账。对端离线期间可能处理中，不能先等付款成功再上线。CLI 退出仅停止签名，托管租户或私有通道可能继续运行；因此不能把退出宣称为真实 `Deferred`。
+### 付款
 
-真正的私有通道离线缓冲需显式管理侧操作，并通过 `lsp_get_payment_delivery` 核对 `Deferred`、截止和失败原因。普通用户命令通过 `get_payment_delivery` 使用用户凭证查询本人参与的投递进度，不读取管理 token；接口不唤醒租户，不暴露其他租户身份或通道。发票和付款查询仍可能唤醒租户；没有可见 delivery 不能推断“没有付款到达”。LSP 必须运行才能暂存付款，重启后的恢复需单独验收。
+客户端本地验证发票签名、网络、资产、金额、有效期及余额，在内存中授权后调用 send_payment。相同 hash 已有远端付款时拒绝发送，不自动重试。
 
-发票有效期、CLI 等待超时、上游缓冲截止与 TLC 安全恢复窗口是不同概念。超时 / Ctrl-C 不取消付款或发票。发票 `Expired` 时若已有 TLC，继续按实际 TLC 核对；不能仅凭发票过期报告网络付款失败。没有入账 TLC 且发票过期时停止此次等待，上游结果仍需核对。已接受的 TLC 真正过期且秘密未释放时，只授权退款，不释放秘密；安全窗口不足时明确报错并保留原资料。
+轮询 get_payment 获取并验证 preimage，再向 SDK 授权 fulfillment，以签署 TLC 移除。所用 Fiber 节点需支持在移除签名前通过 get_payment 提供原像。
 
-## 前台事件等待
+### 签名与完成
 
-`create-invoice --wait`、`pay`、`watch` 和 `resume` 仅在命令运行期间，通过 `wait_channel_update` 等待 LSP 通知，不启动后台常驻进程。租户凭证只能等待本租户已有通道；通知仅包含通道 ID 和不透明游标，不发送原像、签名请求内容或其他租户信息。同一租户的通道、发票、付款和原像持久化变化会更新游标。
+每轮只刷新本次操作、处理通道签名、尝试收款结算并核对结果，轮次之间等待 500ms。签名仅允许 commitment 和 revocation，拒绝包含其他付款 hash 的 TLC 请求。请求必须通过 SDK 校验；签名响应缓存在本次内存中，相同请求重复出现时核验并使用同一响应，不额外落盘。
 
-客户端先读取游标，再核对和推进状态，随后携带上次游标等待。若推进期间发生变化，等待立即返回；否则服务端异步挂起，最多 5 秒后返回供客户端补查。重启节点会产生新游标，后续等待返回后重新核对状态。监听请求失败时退出本次推进并保留恢复资料，网络恢复后使用原 hash `resume` 或 `watch` 重新读取游标；不自动重发付款。外层 `tokio::select!` 继续处理 Ctrl-C 和命令超时。
+远端 Paid / Success 只是完成证据之一。最终还需核对双 lane 中本次 TLC 曾被接受、已移除、最新 SDK 余额与远端余额一致。收款还须确认本地已释放秘密。
 
-新接口需要升级 Fiber 节点及 CLI。收付款的 SDK 校验、签名前持久化、释放秘密前链上 live 校验及最终余额核对保持不变。
+超时、Ctrl-C、付款失败、发票过期或 RPC 错误会停止本次推进并以失败退出。网络付款不会因此取消；本次业务状态和秘密不额外落盘，退出后丢失；已有付款文件不读取、不改写或删除，SDK 底层 signer 存储沿用。当前不处理离线恢复、批量推进或失败 TLC 的自动清理。
 
-2026-10-14 新版真实 devnet 验证：沿用账户 1 / 2 的原通道，账户 2 向账户 1 支付 1 CKB；收款端 `create-invoice --wait` 与付款端 `pay` 均以成功退出，分别在付款 CLI 启动后约 691ms / 970ms 完成核对。原 hash、签名状态及支付记录已保留，详见 [快速开始](../README.md#7-收付款及离线恢复)。此单次端到端结果不作为协议性能基准。
+### 耗时
 
-## 签名、结算及余额核对
+--timings 输出中文摘要；--timings-json 提供机器可读计时，两者互斥。单张发票分别统计等待付款、收款处理和其中的协议等待，后续签名与结算等待计入处理耗时。
 
-签名仅限 commitment 和 revocation。`get_channel_signing_status` 的不可信请求必须通过 SDK 必须验证器，核对原授权、金额、两条 commitment lane 的状态变化及 nonce；返回的签名先持久化再提交。提交响应丢失时重新核验原请求后重放相同响应，不签冲突内容。
-
-收款 `Received` 表示尚待结算。仅当 SDK 最新本地 commitment 中存在匹配入账 TLC、具有完整可恢复签名、独立 CKB RPC 确认原 funding 仍 live 且剩余窗口充分时，才释放 preimage 并立即调用 `settle_invoice`。释放检查额外保留 30 秒 RPC 预算；每次重试都重新检查，不因本地已记录释放意图而绕过检查。
-
-LSP delivery 的 `Succeeded`、发票 `Paid`、SDK TLC 移除及余额增加是不同证据。最终成功要核对 SDK 双 lane 及远端余额；服务端报告不能代替本地证明。协作关闭仍拒绝未结算 TLC 或未同步的双 lane，退款依据结算后的 SDK 最新余额和原出资脚本，不再假设原注入余额。
-
-SDK 边界见 [fiber-lsp-sdk README](../../fiber/crates/fiber-lsp-sdk/README.md)。首期不支持 UDT、MPP、无金额发票、keysend、自动重试发送、后台常驻服务或链上 TLC 追偿。不自动清理运行数据或更换账户，也不自动开新通道。
-
-## 分阶段耗时
-
-`pay`、`create-invoice --wait`、`watch` 和 `resume` 使用 `--timings` 在命令结束时输出中文摘要，时间自动换算为秒、毫秒或微秒，多次阶段显示累计、次数及最长单次。准备时间是收付款流程进入 drive 前的区间，账户恢复属于其子项；外部签名下分 SDK、恢复资料保存和提交请求。状态刷新、收款释放及存储存在包含关系，不能把各行直接相加。单张发票的 create-invoice --wait / resume 另记 payment.wait_for_receipt（本次开始在线推进到首次观察到匹配 hash 的入账 TLC）和 payment.receipt_processing（该观察点到本次核对结束）。只排除前者，处理中的后续签名/结算等待仍计入收款处理，并通过 payment.receipt_protocol_wait 单列。不要从命令时间扣除整个 LSP 等待区间；旧聚合日志没有这个分界，不能回推出精确收款处理耗时。超时或中断会显示处理尚未完成，尚未观察到付款时不报告已完成的处理耗时。恢复命令只统计本次窗口，watch 多笔操作不冒充单笔延迟。
-
-`--timings-json` 保留原机器可读计时 schema，供自动基准采集；不与 `--timings` 同时使用。未指定两者时不采集或输出计时。
+SDK 边界见 [fiber-lsp-sdk README](../../fiber/crates/fiber-lsp-sdk/README.md)。历史运行数据不删除，payments.json 不再参与收付款流程。

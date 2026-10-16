@@ -1,9 +1,8 @@
-//! Locally authorized off-chain operations. The SDK is the signing trust boundary.
+//! One online payment at a time. Both parties stay online until settlement.
 use crate::{
     account::ClientAccount,
     channel,
     rpc::{Config, MissingRecord, Rpc},
-    store::{AccountDir, atomic_write, read_private},
     wallet::{CKB, Wallet},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -12,18 +11,15 @@ use fiber_json_types::{
     Channel, ChannelSigningStatus, ChannelSigningTransition, ChannelState, CkbInvoiceStatus,
     GetChannelSigningStatusResult, GetInvoiceResult, GetPaymentCommandResult, Hash256,
     InvoiceResult, NewInvoiceParams, PaymentStatus, SubmitChannelSignatureParams,
-    WaitChannelUpdateParams, WaitChannelUpdateResult,
 };
 use fiber_lsp_sdk::{
     PaymentAuthorization, ProcessOutcome, RecoveryRecord, SigningPolicy, SubmitParams,
 };
 use fiber_types::{CkbInvoice, Currency, HashAlgorithm};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::{HashMap, HashSet},
     io::Write,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const MAX_TLC_MS: u64 = 14 * 24 * 60 * 60 * 1000;
@@ -32,12 +28,10 @@ const FINAL_TLC_MS: u64 = 24 * 60 * 60 * 1000;
 #[derive(Args)]
 pub struct PayOptions {
     pub invoice: String,
-    #[arg(long, value_parser = parse_fee, value_name = "CKB")]
-    pub max_fee: u64,
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout: u64,
     #[command(flatten)]
-    pub client: crate::ClientOptions,
+    pub client: crate::CurrentClientOptions,
 }
 #[derive(Args)]
 pub struct InvoiceOptions {
@@ -45,40 +39,10 @@ pub struct InvoiceOptions {
     pub amount: u64,
     #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..))]
     pub expiry: u64,
-    #[arg(long)]
-    pub wait: bool,
-    #[arg(long, requires = "wait", value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout: Option<u64>,
     #[command(flatten)]
-    pub client: crate::ClientOptions,
-}
-#[derive(Args)]
-pub struct HashOptions {
-    #[arg(long)]
-    pub payment_hash: Hash256,
-    #[command(flatten)]
-    pub client: crate::ClientOptions,
-}
-#[derive(Args)]
-pub struct ResumeOptions {
-    #[command(flatten)]
-    pub operation: HashOptions,
-    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
-    pub timeout: u64,
-}
-
-fn parse_fee(text: &str) -> std::result::Result<u64, String> {
-    if !text.is_empty()
-        && text.bytes().all(|b| b == b'0' || b == b'.')
-        && text.matches('.').count() <= 1
-        && !text.starts_with('.')
-        && !text.ends_with('.')
-        && text.split('.').nth(1).is_none_or(|s| s.len() <= 8)
-    {
-        Ok(0)
-    } else {
-        channel::parse_amount(text)
-    }
+    pub client: crate::CurrentClientOptions,
 }
 fn now_ms() -> Result<u64> {
     Ok(u64::try_from(
@@ -89,117 +53,27 @@ fn ckb(value: u128) -> String {
     format!("{}.{:08}", value / u128::from(CKB), value % u128::from(CKB))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Phase {
-    IntentSaved,
-    Submitted,
-    Pending,
-    RemoteSuccess,
-    Complete,
-    Failed,
-    ExpiredPending,
-    Expired,
-}
-#[derive(Clone, Deserialize, Serialize)]
 struct Operation {
     hash: Hash256,
     channel_id: Hash256,
     inbound: bool,
     amount: u128,
-    max_fee: u64,
     authorization: PaymentAuthorization,
     invoice: Option<String>,
     preimage: Option<Hash256>,
     expiry_seconds: Option<u64>,
-    creation_started: bool,
-    send_started: bool,
     release_started: bool,
-    #[serde(default)]
-    cancellation_started: bool,
-    phase: Phase,
-    remote_status: Option<String>,
-    #[serde(default)]
-    remote_error: Option<String>,
-    #[serde(default)]
-    latest_progress: Option<String>,
-    updated_at_ms: u64,
+    received: bool,
+    succeeded: bool,
+    complete: bool,
+    pending_signature: Option<PendingSignature>,
     // Latest versions before the operation. A successful result requires both
     // lanes to have accepted and removed this exact authorized TLC afterwards.
     start_versions: [u64; 2],
 }
-#[derive(Deserialize, Serialize)]
 struct PendingSignature {
     status: ChannelSigningStatus,
     params: SubmitChannelSignatureParams,
-}
-#[derive(Deserialize, Serialize)]
-struct Book {
-    format_version: u32,
-    tenant_id: String,
-    operations: Vec<Operation>,
-    pending_signature: Option<PendingSignature>,
-}
-impl Book {
-    fn load(account: &ClientAccount) -> Result<Self> {
-        let path = account.dir.path.join("payments.json");
-        let book = if path.try_exists()? {
-            serde_json::from_slice::<Self>(&read_private(&path)?)
-                .map_err(|_| anyhow::anyhow!("payments.json 损坏；原文件已保留"))?
-        } else {
-            Self {
-                format_version: 1,
-                tenant_id: account.session.tenant_id().as_str().into(),
-                operations: vec![],
-                pending_signature: None,
-            }
-        };
-        ensure!(
-            book.format_version == 1 && book.tenant_id == account.session.tenant_id().as_str(),
-            "收付款记录版本或账户归属不一致"
-        );
-        for (i, op) in book.operations.iter().enumerate() {
-            ensure!(
-                account.session.binding(op.channel_id.into()).is_some(),
-                "收付款通道不属于当前账户"
-            );
-            ensure!(
-                !book.operations[..i].iter().any(|p| p.hash == op.hash),
-                "存在重复付款 hash"
-            );
-            ensure!(
-                op.authorization.payment_hash == op.hash.into()
-                    && op.authorization.inbound == op.inbound
-                    && op.authorization.amount
-                        == op
-                            .amount
-                            .checked_add(u128::from(op.max_fee))
-                            .context("授权金额溢出")?,
-                "收付款记录与 SDK 授权不一致"
-            );
-            if op.inbound {
-                let preimage = op.preimage.context("收款秘密缺失；不能重新生成")?;
-                ensure!(
-                    op.max_fee == 0
-                        && op.authorization.hash_algorithm.hash(preimage.0) == op.hash.0,
-                    "收款秘密或费用不匹配"
-                );
-            }
-        }
-        Ok(book)
-    }
-    fn save(&self, dir: &AccountDir) -> Result<()> {
-        let serialize = crate::timings::Span::new("store.payments.serialize");
-        let bytes = serde_json::to_vec_pretty(self)?;
-        drop(serialize);
-        atomic_write(&dir.path.join("payments.json"), &bytes)
-    }
-    fn index(&self, hash: Hash256) -> Result<usize> {
-        self.operations
-            .iter()
-            .position(|p| p.hash == hash)
-            .context("当前账户没有此付款 hash 的本地授权")
-    }
 }
 fn token(account: &ClientAccount) -> Result<&str> {
     account.session.tenant_token().context("缺少用户凭证")
@@ -296,7 +170,7 @@ async fn ready_channel(account: &ClientAccount, rpc: &Rpc, id: Hash256) -> Resul
     );
     ensure!(
         channel.state == ChannelState::ChannelReady,
-        "通道不可收付款：远端状态 {:?}；保留原付款和恢复资料",
+        "通道不可收付款：远端状态 {:?}",
         channel.state
     );
     Ok(channel)
@@ -304,95 +178,66 @@ async fn ready_channel(account: &ClientAccount, rpc: &Rpc, id: Hash256) -> Resul
 
 pub async fn pay(options: PayOptions) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.pay");
-    options.client.current_only()?;
-    let config = Config::load(options.client.config.as_deref())?;
-    let (dir, _selection) =
-        crate::accounts::choose(&config.root, &options.client, false, false, false)?;
+    let client = crate::ClientOptions::from(options.client);
+    let config = Config::load(client.config.as_deref())?;
+    let (dir, _selection) = crate::accounts::choose(&config.root, &client, false, false, false)?;
     let mut account = ClientAccount::load_dir(&config, dir).await?;
     account.session = account.session.with_policy(SigningPolicy::Manual);
     let rpc = Rpc::new(&config.rpc_url)?;
     let parsed = invoice(&options.invoice)?;
     let hash: Hash256 = (*parsed.payment_hash()).into();
-    let mut book = Book::load(&account)?;
-    if let Ok(i) = book.index(hash) {
-        let op = &book.operations[i];
-        ensure!(
-            !op.inbound
-                && op.invoice.as_deref() == Some(&options.invoice)
-                && op.max_fee == options.max_fee,
-            "同 hash 的原付款授权不同；不能替换"
-        );
-    } else {
-        let expires = invoice_deadline(&parsed)?;
-        ensure!(now_ms()? < expires, "发票已过期");
-        let (id, wallet, _, _) = channel::payment_context(&account)?;
-        wallet.check_network().await?;
-        let channel = ready_channel(&account, &rpc, id).await?;
-        let amount = parsed.amount().unwrap();
-        let total = amount
-            .checked_add(u128::from(options.max_fee))
-            .context("付款金额及费用溢出")?;
-        ensure!(
-            total <= u128::from(u64::MAX) && channel.local_balance >= total,
-            "本方可用余额不足"
-        );
-        let records = account
-            .session
-            .channel_signer(id.into())
-            .await?
-            .recovery_records()
-            .await?;
-        let op = Operation {
-            hash,
-            channel_id: id,
-            inbound: false,
-            amount,
-            max_fee: options.max_fee,
-            authorization: authorization(
-                hash,
-                false,
-                total,
-                parsed.hash_algorithm().copied().unwrap_or_default(),
-                expires,
-            )?,
-            invoice: Some(options.invoice),
-            preimage: None,
-            expiry_seconds: None,
-            creation_started: false,
-            send_started: false,
-            release_started: false,
-            cancellation_started: false,
-            phase: Phase::IntentSaved,
-            remote_status: None,
-            remote_error: None,
-            latest_progress: None,
-            updated_at_ms: now_ms()?,
-            start_versions: versions(&records),
-        };
-        book.operations.push(op);
-        book.save(&account.dir)?;
-    }
-    println!(
-        "付款 hash：{hash}\n费用上限：{} CKB",
-        ckb(u128::from(options.max_fee))
+    let expires = invoice_deadline(&parsed)?;
+    ensure!(now_ms()? < expires, "发票已过期");
+    let (id, wallet, _, _) = channel::payment_context(&account)?;
+    wallet.check_network().await?;
+    let channel = ready_channel(&account, &rpc, id).await?;
+    let amount = parsed.amount().unwrap();
+    // Match Fiber's SendPaymentData::new default for the exact SDK TLC authorization.
+    let fee = (amount * 5).div_ceil(1000);
+    let total = amount.checked_add(fee).context("付款金额及费用溢出")?;
+    ensure!(
+        total <= u128::from(u64::MAX) && channel.local_balance >= total,
+        "本方可用余额不足"
     );
-    wait(
-        &mut account,
-        &rpc,
-        &mut book,
-        Some(hash),
-        Some(options.timeout),
-        &options.client,
-    )
-    .await
+    let records = account
+        .session
+        .channel_signer(id.into())
+        .await?
+        .recovery_records()
+        .await?;
+    let mut op = Operation {
+        hash,
+        channel_id: id,
+        inbound: false,
+        amount,
+        authorization: authorization(
+            hash,
+            false,
+            total,
+            parsed.hash_algorithm().copied().unwrap_or_default(),
+            expires,
+        )?,
+        invoice: Some(options.invoice),
+        preimage: None,
+        expiry_seconds: None,
+        release_started: false,
+        received: false,
+        succeeded: false,
+        complete: false,
+        pending_signature: None,
+        start_versions: versions(&records),
+    };
+    println!("付款 hash：{hash}\nFiber 默认费用预算：{} CKB", ckb(fee));
+    register(&account, &op).await?;
+    send_payment(&account, &rpc, &op).await?;
+    wait(&mut account, &rpc, &mut op, Some(options.timeout)).await
 }
 
 pub async fn create_invoice(options: InvoiceOptions) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.invoice");
-    options.client.current_only()?;
-    let config = Config::load(options.client.config.as_deref())?;
-    let (dir, _selection) =
-        crate::accounts::choose(&config.root, &options.client, false, false, false)?;
+    let client = crate::ClientOptions::from(options.client);
+    let config = Config::load(client.config.as_deref())?;
+    let (dir, _selection) = crate::accounts::choose(&config.root, &client, false, false, false)?;
     let mut account = ClientAccount::load_dir(&config, dir).await?;
     account.session = account.session.with_policy(SigningPolicy::Manual);
     let rpc = Rpc::new(&config.rpc_url)?;
@@ -411,13 +256,11 @@ pub async fn create_invoice(options: InvoiceOptions) -> Result<()> {
         .await?
         .recovery_records()
         .await?;
-    let mut book = Book::load(&account)?;
-    book.operations.push(Operation {
+    let mut op = Operation {
         hash,
         channel_id: id,
         inbound: true,
         amount: u128::from(options.amount),
-        max_fee: 0,
         authorization: authorization(
             hash,
             true,
@@ -428,47 +271,18 @@ pub async fn create_invoice(options: InvoiceOptions) -> Result<()> {
         invoice: None,
         preimage: Some(preimage.into()),
         expiry_seconds: Some(options.expiry),
-        creation_started: false,
-        send_started: false,
         release_started: false,
-        cancellation_started: false,
-        phase: Phase::IntentSaved,
-        remote_status: None,
-        remote_error: None,
-        latest_progress: None,
-        updated_at_ms: created,
+        received: false,
+        succeeded: false,
+        complete: false,
+        pending_signature: None,
         start_versions: versions(&records),
-    });
-    book.save(&account.dir)?;
-    println!("创建意图已保存；付款 hash：{hash}");
+    };
+    register(&account, &op).await?;
+    create_remote_invoice(&account, &rpc, &mut op).await?;
+    print_invoice(&op);
     std::io::stdout().flush()?;
-    let i = book.index(hash)?;
-    let result = async {
-        register(&account, &book.operations[i]).await?;
-        ensure_invoice(&account, &rpc, &mut book, i).await
-    }
-    .await;
-    if let Err(e) = result {
-        recovery(&account, hash, &options.client);
-        return Err(e);
-    }
-    print_invoice(&book.operations[i]);
-    std::io::stdout().flush()?;
-    if options.wait {
-        wait(
-            &mut account,
-            &rpc,
-            &mut book,
-            Some(hash),
-            options.timeout,
-            &options.client,
-        )
-        .await
-    } else {
-        println!("已退出在线推进；重连后才可完成收款。CLI 退出不保证私有通道离线。");
-        recovery(&account, hash, &options.client);
-        Ok(())
-    }
+    wait(&mut account, &rpc, &mut op, options.timeout).await
 }
 
 fn validate_created(
@@ -500,70 +314,29 @@ fn validate_created(
     );
     Ok(())
 }
-async fn lookup_invoice(
+async fn create_remote_invoice(
     account: &ClientAccount,
     rpc: &Rpc,
-    hash: Hash256,
-) -> Result<Option<GetInvoiceResult>> {
-    match rpc
-        .call(
-            "get_invoice",
-            json!([{ "payment_hash": hash }]),
-            token(account)?,
-        )
-        .await
-    {
-        Ok(result) => Ok(Some(result)),
-        Err(e) if e.downcast_ref::<MissingRecord>().is_some() => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-async fn ensure_invoice(
-    account: &ClientAccount,
-    rpc: &Rpc,
-    book: &mut Book,
-    i: usize,
+    op: &mut Operation,
 ) -> Result<()> {
-    if book.operations[i].invoice.is_some() {
-        return Ok(());
-    }
-    let op = &book.operations[i];
-    let remote = if op.creation_started {
-        lookup_invoice(account, rpc, op.hash).await?
-    } else {
-        None
+    let request = NewInvoiceParams {
+        amount: op.amount,
+        currency: fiber_json_types::Currency::Fibd,
+        payment_hash: Some(op.hash),
+        expiry: op.expiry_seconds,
+        final_expiry_delta: Some(FINAL_TLC_MS),
+        hash_algorithm: Some(fiber_json_types::HashAlgorithm::CkbHash),
+        allow_mpp: Some(false),
+        allow_trampoline_routing: Some(true),
+        ..Default::default()
     };
-    let (address, object) = if let Some(remote) = remote {
-        (remote.invoice_address, remote.invoice)
-    } else {
-        ensure!(
-            now_ms()? < op.authorization.expires_at_ms,
-            "原创建授权已过期；秘密保留，不重新创建发票"
-        );
-        book.operations[i].creation_started = true;
-        book.save(&account.dir)?;
-        let op = &book.operations[i];
-        let request = NewInvoiceParams {
-            amount: op.amount,
-            currency: fiber_json_types::Currency::Fibd,
-            payment_hash: Some(op.hash),
-            expiry: op.expiry_seconds,
-            final_expiry_delta: Some(FINAL_TLC_MS),
-            hash_algorithm: Some(fiber_json_types::HashAlgorithm::CkbHash),
-            allow_mpp: Some(false),
-            allow_trampoline_routing: Some(true),
-            ..Default::default()
-        };
-        let result: InvoiceResult = rpc
-            .call("new_invoice", json!([request]), token(account)?)
-            .await?;
-        (result.invoice_address, result.invoice)
-    };
-    validate_created(account, &book.operations[i], &address, &object)?;
-    book.operations[i].invoice = Some(address);
-    book.operations[i].phase = Phase::Pending;
-    book.operations[i].updated_at_ms = now_ms()?;
-    book.save(&account.dir)
+    let result: InvoiceResult = rpc
+        .call("new_invoice", json!([request]), token(account)?)
+        .await?;
+    let (address, object) = (result.invoice_address, result.invoice);
+    validate_created(account, op, &address, &object)?;
+    op.invoice = Some(address);
+    Ok(())
 }
 fn print_invoice(op: &Operation) {
     println!(
@@ -572,47 +345,6 @@ fn print_invoice(op: &Operation) {
         op.hash,
         op.authorization.expires_at_ms
     );
-}
-fn recovery(account: &ClientAccount, hash: Hash256, options: &crate::ClientOptions) {
-    let _ = account;
-    println!(
-        "恢复：./lsp-cli resume --payment-hash {hash} {}",
-        options.recovery_selector()
-    );
-    if let Some(path) = &options.config {
-        println!("恢复时继续使用 --config {}", path.display());
-    }
-}
-
-pub async fn resume(options: ResumeOptions) -> Result<()> {
-    let client = &options.operation.client;
-    let config = Config::load(client.config.as_deref())?;
-    let (dir, _selection) = crate::accounts::choose(&config.root, client, false, false, false)?;
-    let mut account = ClientAccount::load_dir(&config, dir).await?;
-    account.session = account.session.with_policy(SigningPolicy::Manual);
-    let rpc = Rpc::new(&config.rpc_url)?;
-    let mut book = Book::load(&account)?;
-    book.index(options.operation.payment_hash)?;
-    wait(
-        &mut account,
-        &rpc,
-        &mut book,
-        Some(options.operation.payment_hash),
-        Some(options.timeout),
-        client,
-    )
-    .await
-}
-pub async fn watch(options: crate::ClientOptions) -> Result<()> {
-    options.current_only()?;
-    let config = Config::load(options.config.as_deref())?;
-    let (dir, _selection) = crate::accounts::choose(&config.root, &options, false, false, true)?;
-    let mut account = ClientAccount::load_dir(&config, dir).await?;
-    account.session = account.session.with_policy(SigningPolicy::Manual);
-    let rpc = Rpc::new(&config.rpc_url)?;
-    let mut book = Book::load(&account)?;
-    println!("前台推进本账户原授权；Ctrl-C 停止等待，保留发票与恢复资料。");
-    wait(&mut account, &rpc, &mut book, None, None, &options).await
 }
 struct ReceiptTiming {
     hash: Hash256,
@@ -658,19 +390,11 @@ impl ReceiptTiming {
 async fn wait(
     account: &mut ClientAccount,
     rpc: &Rpc,
-    book: &mut Book,
-    target: Option<Hash256>,
+    op: &mut Operation,
     timeout: Option<u64>,
-    options: &crate::ClientOptions,
 ) -> Result<()> {
-    let mut receipt = if let Some(hash) = target {
-        let op = &book.operations[book.index(hash)?];
-        (op.inbound && !matches!(op.phase, Phase::Complete | Phase::Failed | Phase::Expired))
-            .then(|| ReceiptTiming::new(hash))
-    } else {
-        None
-    };
-    let future = drive(account, rpc, book, target, receipt.as_mut());
+    let mut receipt = op.inbound.then(|| ReceiptTiming::new(op.hash));
+    let future = drive(account, rpc, op, receipt.as_mut());
     let deadline = async {
         if let Some(seconds) = timeout {
             tokio::time::sleep(Duration::from_secs(seconds)).await;
@@ -680,23 +404,13 @@ async fn wait(
     };
     let result = tokio::select! {
         result = future => result,
-        result = tokio::signal::ctrl_c() => { result?; println!("已停止本次等待；网络操作未取消。"); Ok(()) },
-        _ = deadline => { println!("本次等待超时；网络操作未取消，结果需继续核对。"); Ok(()) },
+        result = tokio::signal::ctrl_c() => result.map_err(anyhow::Error::from).and_then(|()| {
+            bail!("收付款推进已中断；网络操作未取消，当前版本不支持中断恢复")
+        }),
+        _ = deadline => Err(anyhow::anyhow!("收付款等待超时；网络操作未取消，当前版本不支持中断恢复")),
     };
     if let Some(receipt) = receipt {
-        let complete = book.operations[book.index(receipt.hash)?].phase == Phase::Complete;
-        receipt.finish(complete);
-    }
-    if let Some(hash) = target {
-        let op = &book.operations[book.index(hash)?];
-        if op.phase != Phase::Complete
-            && let Some(progress) = &op.latest_progress
-        {
-            println!("最后核对的进度（可能已变化）：\n{progress}");
-        }
-        recovery(account, hash, options);
-    } else {
-        println!("再次执行 ./lsp-cli watch 或按原 hash resume。");
+        receipt.finish(op.complete);
     }
     result
 }
@@ -719,231 +433,46 @@ async fn lookup_payment(
         Err(e) => Err(e),
     }
 }
-fn payment_params(account: &ClientAccount, op: &Operation) -> Result<serde_json::Value> {
-    // Trampoline consumes the fixed fee budget. Avoid the server's default fee
-    // rate silently reducing it and invalidating the SDK's exact TLC amount.
-    let rate = u64::try_from((u128::from(op.max_fee) * 1000).div_ceil(op.amount))?;
-    Ok(json!([{ "invoice": op.invoice, "payment_hash": op.hash,
-        "max_fee_amount": format!("0x{:x}", op.max_fee), "max_fee_rate": format!("0x{rate:x}"),
+fn payment_params(account: &ClientAccount, op: &Operation) -> serde_json::Value {
+    json!([{ "invoice": op.invoice, "payment_hash": op.hash,
         "max_parts": "0x1", "trampoline_hops": [account.lsp_public_key],
         "keysend": false, "allow_self_payment": false,
-        "tlc_expiry_limit": format!("0x{MAX_TLC_MS:x}") }]))
+        "tlc_expiry_limit": format!("0x{MAX_TLC_MS:x}") }])
 }
-async fn send_once(account: &ClientAccount, rpc: &Rpc, book: &mut Book, i: usize) -> Result<()> {
+async fn send_payment(account: &ClientAccount, rpc: &Rpc, op: &Operation) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.send");
-    let op = &book.operations[i];
-    if op.send_started {
-        return Ok(());
-    }
     ensure!(
         now_ms()? < op.authorization.expires_at_ms,
         "原付款授权已过期；未发送新付款"
     );
-    // A duplicate remote hash is never replaced even if no local response exists.
-    if lookup_payment(account, rpc, op.hash).await?.is_some() {
-        book.operations[i].send_started = true;
-        book.save(&account.dir)?;
-        return Ok(());
-    }
-    book.operations[i].send_started = true;
-    book.operations[i].phase = Phase::Submitted;
-    book.operations[i].updated_at_ms = now_ms()?;
-    book.save(&account.dir)?;
+    ensure!(
+        lookup_payment(account, rpc, op.hash).await?.is_none(),
+        "远端已有此付款 hash；不重复发送"
+    );
     let response: GetPaymentCommandResult = rpc
-        .call(
-            "send_payment",
-            payment_params(account, &book.operations[i])?,
-            token(account)?,
-        )
+        .call("send_payment", payment_params(account, op), token(account)?)
         .await?;
     ensure!(
-        response.payment_hash == book.operations[i].hash,
+        response.payment_hash == op.hash,
         "发送结果属于其他付款 hash"
     );
     Ok(())
 }
 
-async fn delivery_progress(
-    account: &ClientAccount,
-    rpc: &Rpc,
-    hash: Hash256,
-) -> Result<Option<fiber_json_types::PaymentDeliveryProgress>> {
-    let response: fiber_json_types::GetPaymentDeliveryResult = rpc
-        .call(
-            "get_payment_delivery",
-            json!([{ "payment_hash": hash }]),
-            token(account)?,
-        )
-        .await?;
-    let result = response.delivery;
-    if let Some(progress) = &result {
-        ensure!(progress.payment_hash == hash, "LSP 投递查询 hash 不符");
-    }
-    Ok(result)
-}
-
-fn describe_delivery(progress: &fiber_json_types::PaymentDeliveryProgress) -> String {
-    use fiber_json_types::LspPaymentDeliveryStatus as Status;
-    let state = match progress.status {
-        Status::Deferred => "暂存，等待通道在线或重试；尚未最终失败",
-        Status::Dispatching => "正在转发",
-        Status::InFlight => "下游付款处理中；不代表收款方已收到 TLC",
-        Status::SettlingUpstream => "下游结果已确定，正在结算付款方 TLC",
-        Status::Succeeded => "投递成功",
-        Status::Failed => "投递已失败；发票本身未取消",
-    };
-    let mut result = format!(
-        "LSP 投递：{state}；尝试 {} 次；投递截止（Unix ms）：{}",
-        progress.attempt_count, progress.buffer_deadline
-    );
-    if let Some(error) = &progress.last_error {
-        result.push_str(&format!("\nLSP 最近错误：{error}"));
-    }
-    if let Some(error) = &progress.failure_reason {
-        result.push_str(&format!("\nLSP 失败原因：{error}"));
-    }
-    result
-}
-
 async fn drive(
     account: &mut ClientAccount,
     rpc: &Rpc,
-    book: &mut Book,
-    target: Option<Hash256>,
+    op: &mut Operation,
     mut receipt: Option<&mut ReceiptTiming>,
 ) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.drive");
-    if let Some(hash) = target {
-        let op = &book.operations[book.index(hash)?];
-        if op.phase == Phase::Complete {
-            println!(
-                "本地已完成（原结果）：{}；查询远端请使用对应 status 命令",
-                op.hash
-            );
-            return Ok(());
-        }
-    }
     let (id, wallet, local_reserve, remote_reserve) = channel::payment_context(account)?;
-    if let Some(receipt) = receipt.as_deref_mut() {
-        let op = &book.operations[book.index(receipt.hash)?];
-        let records = account
-            .session
-            .channel_signer(id.into())
-            .await?
-            .recovery_records()
-            .await?;
-        if op.release_started
-            || matches!(op.remote_status.as_deref(), Some("Received" | "Paid"))
-            || records.iter().any(|record| {
-                record
-                    .settlement
-                    .data
-                    .tlcs
-                    .iter()
-                    .any(|tlc| tlc.payment_hash == op.hash.into())
-            })
-        {
-            receipt.observe_tlc(op.hash, true);
-        }
-    }
-    // Take the cursor before checking state so changes during this drive pass are retained.
-    let mut revision = wait_channel_update(account, rpc, id, None).await?;
-    wallet.check_network().await?;
-    for i in 0..book.operations.len() {
-        ensure!(book.operations[i].channel_id == id, "收付款属于其他通道");
-        register(account, &book.operations[i]).await?;
-        if book.operations[i].inbound && book.operations[i].invoice.is_none() {
-            ensure_invoice(account, rpc, book, i).await?;
-            print_invoice(&book.operations[i]);
-        }
-        if !book.operations[i].inbound && !book.operations[i].send_started {
-            send_once(account, rpc, book, i).await?;
-        }
-    }
-    let mut last_probe: Option<Instant> = None;
-    let mut displayed: HashMap<Hash256, (String, Instant)> = HashMap::new();
-    let mut failed_deliveries = HashSet::new();
+    ensure!(op.channel_id == id, "收付款属于其他通道");
     loop {
-        let channel = ready_channel(account, rpc, id).await?;
-        for i in 0..book.operations.len() {
-            refresh(account, rpc, book, i).await?;
-        }
-        // Poll diagnostics less frequently than signing. Print changes and a 15-second heartbeat.
-        if last_probe.is_none_or(|at| at.elapsed() >= Duration::from_secs(5)) {
-            for op in &mut book.operations {
-                if target.is_some_and(|hash| hash != op.hash) || op.phase == Phase::Complete {
-                    continue;
-                }
-                let delivery = match delivery_progress(account, rpc, op.hash).await {
-                    Ok(Some(progress)) => {
-                        if matches!(
-                            progress.status,
-                            fiber_json_types::LspPaymentDeliveryStatus::Failed
-                        ) {
-                            failed_deliveries.insert(op.hash);
-                        } else {
-                            failed_deliveries.remove(&op.hash);
-                        }
-                        describe_delivery(&progress)
-                    }
-                    Ok(None) => "LSP 尚无本账户可见投递记录；不能据此判断付款结果".into(),
-                    Err(error) => format!("LSP 投递进度未核对：{error:#}"),
-                };
-                let message = format!(
-                    "{}进度；hash：{}；本地：{:?}；远端：{}\n通道可用余额（本方 / LSP）：{} / {} CKB\n{}{}",
-                    if op.inbound { "收款" } else { "付款" },
-                    op.hash,
-                    op.phase,
-                    op.remote_status.as_deref().unwrap_or("未核对"),
-                    ckb(channel.local_balance),
-                    ckb(channel.remote_balance),
-                    delivery,
-                    op.remote_error
-                        .as_ref()
-                        .map_or(String::new(), |error| format!("\n付款最近错误：{error}"))
-                );
-                if displayed.get(&op.hash).is_none_or(|(previous, at)| {
-                    previous != &message || at.elapsed() >= Duration::from_secs(15)
-                }) {
-                    println!("{message}");
-                    if op.inbound
-                        && op.remote_status.as_deref() == Some("Open")
-                        && channel.received_tlc_balance == 0
-                        && channel.remote_balance < op.amount
-                    {
-                        println!(
-                            "入账流动性不足：LSP 一侧可用余额小于发票金额；仅恢复签名进程不能补充余额。"
-                        );
-                    }
-                    displayed.insert(op.hash, (message.clone(), Instant::now()));
-                }
-                op.latest_progress = Some(message);
-            }
-            book.save(&account.dir)?;
-            last_probe = Some(Instant::now());
-        }
-        if let Some(hash) = target {
-            let op = &book.operations[book.index(hash)?];
-            if failed_deliveries.contains(&hash)
-                && !matches!(
-                    op.remote_status.as_deref(),
-                    Some("Paid" | "Success" | "Cancelled" | "Failed")
-                )
-            {
-                bail!(
-                    "本次 LSP 投递已失败；hash：{hash}；{}。详情见上方进度",
-                    if op.inbound {
-                        "发票未取消，不能据此认定其他付款失败"
-                    } else {
-                        "付款 RPC 尚未报告最终失败，TLC 清理和余额仍待核对；未取消网络付款"
-                    }
-                );
-            }
-        }
-        sign(account, rpc, book, id, receipt.as_deref_mut()).await?;
-        for i in 0..book.operations.len() {
-            release(account, rpc, book, i, &wallet).await?;
-        }
+        ready_channel(account, rpc, id).await?;
+        refresh(account, rpc, op).await?;
+        sign(account, rpc, op, receipt.as_deref_mut()).await?;
+        release(account, rpc, op, &wallet).await?;
         let remote = ready_channel(account, rpc, id).await?;
         let records = account
             .session
@@ -951,110 +480,51 @@ async fn drive(
             .await?
             .recovery_records()
             .await?;
-        for i in 0..book.operations.len() {
-            reconcile(
-                &mut book.operations[i],
-                &records,
-                &remote,
-                local_reserve,
-                remote_reserve,
-            )?;
+        reconcile(op, &records, &remote, local_reserve, remote_reserve)?;
+        if op.complete {
+            println!(
+                "{}完成（远端状态、SDK TLC 移除及余额已核对）\n付款 hash：{}\n金额：{} CKB",
+                if op.inbound { "收款" } else { "付款" },
+                op.hash,
+                ckb(op.amount)
+            );
+            return Ok(());
         }
-        book.save(&account.dir)?;
-        if let Some(hash) = target {
-            let op = &book.operations[book.index(hash)?];
-            if op.phase == Phase::Complete {
-                println!(
-                    "{}完成（远端状态、SDK TLC 移除及余额已核对）\n付款 hash：{}\n金额：{} CKB",
-                    if op.inbound { "收款" } else { "付款" },
-                    hash,
-                    ckb(op.amount)
-                );
-                return Ok(());
-            }
-            if op.phase == Phase::Expired {
-                bail!("发票已过期且当前无入账 TLC；hash：{hash}，上游结果和余额仍需核对");
-            }
-            if op.phase == Phase::Failed {
-                bail!(
-                    "原操作已失败（TLC 清理已核对）；hash：{hash}；原因：{}；不自动再次发送",
-                    op.remote_error
-                        .as_deref()
-                        .unwrap_or("远端未提供，见投递进度")
-                );
-            }
-        }
-        let protocol_wait = receipt
+        let _protocol_wait = receipt
             .as_ref()
             .filter(|receipt| receipt.processing.is_some())
             .map(|_| crate::timings::Span::new("payment.receipt_protocol_wait"));
-        revision = wait_channel_update(account, rpc, id, Some(revision)).await?;
-        drop(protocol_wait);
+        let _poll_wait = crate::timings::Span::new("payment.poll_wait");
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
-async fn wait_channel_update(
-    account: &ClientAccount,
-    rpc: &Rpc,
-    id: Hash256,
-    after: Option<u64>,
-) -> Result<u64> {
-    let result: WaitChannelUpdateResult = rpc
-        .call(
-            "wait_channel_update",
-            json!([WaitChannelUpdateParams {
-                channel_id: id,
-                after,
-                timeout_ms: 5_000
-            }]),
-            token(account)?,
-        )
-        .await
-        .context("LSP 事件等待失败；请确认节点已升级，原付款和恢复资料保留")?;
-    ensure!(result.channel_id == id, "事件等待返回了其他通道");
-    Ok(result.revision)
-}
-async fn refresh(account: &ClientAccount, rpc: &Rpc, book: &mut Book, i: usize) -> Result<()> {
+async fn refresh(account: &ClientAccount, rpc: &Rpc, op: &mut Operation) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.refresh");
-    let op = &mut book.operations[i];
     let signer = account.session.channel_signer(op.channel_id.into()).await?;
     if op.inbound {
-        let remote = lookup_invoice(account, rpc, op.hash)
-            .await?
-            .context("原发票远端不存在；保留秘密与授权")?;
+        let remote: GetInvoiceResult = rpc
+            .call(
+                "get_invoice",
+                json!([{ "payment_hash": op.hash }]),
+                token(account)?,
+            )
+            .await?;
         validate_created(account, op, &remote.invoice_address, &remote.invoice)?;
-        op.remote_status = Some(format!("{:?}", remote.status));
-        let records = signer.recovery_records().await?;
-        let local = records
-            .iter()
-            .filter(|r| !r.reference.for_remote)
-            .max_by_key(|r| r.reference.version);
-        let tlc = local.and_then(|r| {
-            r.settlement
-                .data
-                .tlcs
-                .iter()
-                .find(|t| t.payment_hash == op.hash.into())
-        });
-        let current = now_ms()?;
-        if !op.release_started && tlc.is_some_and(|t| (t.expiry / 1000) * 1000 <= current) {
-            signer.authorize_cancellation(op.hash.into()).await?;
-            op.cancellation_started = true;
-        }
-        if remote.status == CkbInvoiceStatus::Paid {
-            op.phase = Phase::RemoteSuccess;
-        } else if remote.status == CkbInvoiceStatus::Expired || op.cancellation_started {
-            // An accepted TLC may still settle after invoice expiry. No inferred cancellation.
-            op.phase = Phase::ExpiredPending;
-        } else if remote.status == CkbInvoiceStatus::Cancelled && !op.release_started {
-            signer.authorize_cancellation(op.hash.into()).await?;
+
+        match remote.status {
+            CkbInvoiceStatus::Paid => op.succeeded = true,
+            CkbInvoiceStatus::Expired | CkbInvoiceStatus::Cancelled => {
+                bail!("发票已过期或取消；当前版本不支持中断恢复，未继续结算");
+            }
+            CkbInvoiceStatus::Received => op.received = true,
+            _ => {}
         }
     } else if let Some(remote) = lookup_payment(account, rpc, op.hash).await? {
         ensure!(
-            remote.payment_hash == op.hash && remote.fee <= u128::from(op.max_fee),
+            remote.payment_hash == op.hash && remote.fee <= op.authorization.amount - op.amount,
             "付款查询 hash 或费用不符"
         );
-        op.remote_status = Some(format!("{:?}", remote.status));
-        op.remote_error = remote.failed_error.clone();
+
         if let Some(preimage) = remote.payment_preimage {
             ensure!(
                 op.authorization.hash_algorithm.hash(preimage.0) == op.hash.0,
@@ -1068,31 +538,30 @@ async fn refresh(account: &ClientAccount, rpc: &Rpc, book: &mut Book, i: usize) 
         match remote.status {
             PaymentStatus::Success => {
                 ensure!(op.preimage.is_some(), "远端成功但缺少可核验 preimage");
-                op.phase = Phase::RemoteSuccess;
+                op.succeeded = true;
             }
-            PaymentStatus::Failed if op.preimage.is_none() => {
-                signer.authorize_cancellation(op.hash.into()).await?;
+            PaymentStatus::Failed => {
+                bail!(
+                    "付款失败：{}；当前版本不支持中断恢复，不自动重试",
+                    remote.failed_error.as_deref().unwrap_or("远端未提供原因")
+                );
             }
-            _ => {
-                op.phase = Phase::Pending;
-            }
+            _ => {}
         }
     } else {
-        // The submit marker cannot prove whether the server saw the request.
-        // Even confirmed absence does not authorize an automatic second send.
-        op.remote_status = Some("不存在；原发送结果未知，未重发".into());
+        bail!("远端未找到本次付款，发送结果未知；不自动重发");
     }
-    op.updated_at_ms = now_ms()?;
-    book.save(&account.dir)
+    Ok(())
 }
+
 async fn sign(
     account: &mut ClientAccount,
     rpc: &Rpc,
-    book: &mut Book,
-    id: Hash256,
+    op: &mut Operation,
     receipt: Option<&mut ReceiptTiming>,
 ) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.external_sign");
+    let id = op.channel_id;
     let result: GetChannelSigningStatusResult = rpc
         .call(
             "get_channel_signing_status",
@@ -1101,6 +570,19 @@ async fn sign(
         )
         .await?;
     ensure!(result.channel_id == id, "签名请求属于其他通道");
+    if let ChannelSigningStatus::SignatureRequired {
+        settlement: Some(settlement),
+        ..
+    } = &result.status
+    {
+        ensure!(
+            settlement
+                .tlcs
+                .iter()
+                .all(|tlc| tlc.payment_hash == op.hash),
+            "签名请求包含其他付款；当前仅支持单笔在线收付款"
+        );
+    }
     if let Some(receipt) = receipt {
         receipt.observe_status(&result.status);
     }
@@ -1122,7 +604,7 @@ async fn sign(
         ),
         "收付款不授权关闭、公告或链上签名"
     );
-    let saved = book
+    let saved = op
         .pending_signature
         .as_ref()
         .filter(|saved| saved.params.request_id == *request_id);
@@ -1157,20 +639,16 @@ async fn sign(
             }
             ProcessOutcome::ReadyToSubmit(params) => params,
             ProcessOutcome::Idle => return Ok(()),
-            ProcessOutcome::Denied => bail!("SDK 拒绝签名；原资料保留"),
+            ProcessOutcome::Denied => bail!("SDK 拒绝签名"),
         };
         let SubmitParams::Channel(params) = submit else {
             bail!("收付款不授权 watchtower 签名");
         };
         drop(sdk);
-        let replay = crate::timings::Span::new("payment.replay_persist");
-        account.save()?;
-        book.pending_signature = Some(PendingSignature {
+        op.pending_signature = Some(PendingSignature {
             status: result.status,
             params: params.clone(),
         });
-        book.save(&account.dir)?;
-        drop(replay);
         params
     };
     let _: serde_json::Value = rpc
@@ -1181,13 +659,11 @@ async fn sign(
 async fn release(
     account: &ClientAccount,
     rpc: &Rpc,
-    book: &mut Book,
-    i: usize,
+    op: &mut Operation,
     wallet: &Wallet,
 ) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.release");
-    let op = &book.operations[i];
-    if !op.inbound || op.cancellation_started || op.remote_status.as_deref() != Some("Received") {
+    if !op.inbound || !op.received || op.release_started {
         return Ok(());
     }
     let signer = account.session.channel_signer(op.channel_id.into()).await?;
@@ -1210,8 +686,7 @@ async fn release(
         return Ok(());
     }
     let preimage = op.preimage.context("缺少本地收款秘密")?;
-    // Check fresh live funding and remaining window on every retry. Never
-    // bypass this because release_started or remote Received was persisted.
+    // Verify live funding and the safety window immediately before release.
     signer
         .authorize_preimage_release(
             op.hash.into(),
@@ -1220,16 +695,14 @@ async fn release(
             wallet,
         )
         .await?;
-    book.operations[i].release_started = true;
-    book.operations[i].updated_at_ms = now_ms()?;
-    book.save(&account.dir)?;
     let _: serde_json::Value = rpc
         .call(
             "settle_invoice",
-            json!([{ "payment_hash": book.operations[i].hash, "payment_preimage": preimage }]),
+            json!([{ "payment_hash": op.hash, "payment_preimage": preimage }]),
             token(account)?,
         )
         .await?;
+    op.release_started = true;
     Ok(())
 }
 fn reconcile(
@@ -1240,13 +713,7 @@ fn reconcile(
     remote_reserve: u64,
 ) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.reconcile");
-    let successful =
-        op.remote_status.as_deref() == Some(if op.inbound { "Paid" } else { "Success" });
-    let failed =
-        op.remote_status.as_deref() == Some(if op.inbound { "Cancelled" } else { "Failed" });
-    let expired =
-        op.inbound && (op.remote_status.as_deref() == Some("Expired") || op.cancellation_started);
-    if !successful && !failed && !expired {
+    if !op.succeeded {
         return Ok(());
     }
     let Ok((local, peer)) = channel::settled_balances(records) else {
@@ -1263,585 +730,22 @@ fn reconcile(
     {
         return Ok(());
     }
-    if expired {
-        op.phase = Phase::Expired;
+    let seen = [false, true].into_iter().enumerate().all(|(i, lane)| {
+        records.iter().any(|r| {
+            r.reference.for_remote == lane
+                && r.reference.version > op.start_versions[i]
+                && r.settlement.data.tlcs.iter().any(|t| {
+                    t.payment_hash == op.hash.into() && t.payment_amount == op.authorization.amount
+                })
+        })
+    });
+    if !seen || (op.inbound && !op.release_started) {
         return Ok(());
     }
-    if successful {
-        let seen = [false, true].into_iter().enumerate().all(|(i, lane)| {
-            records.iter().any(|r| {
-                r.reference.for_remote == lane
-                    && r.reference.version > op.start_versions[i]
-                    && r.settlement.data.tlcs.iter().any(|t| {
-                        t.payment_hash == op.hash.into()
-                            && t.payment_amount == op.authorization.amount
-                    })
-            })
-        });
-        if !seen || (op.inbound && !op.release_started) {
-            return Ok(());
-        }
-        op.phase = Phase::Complete;
-    } else {
-        op.phase = Phase::Failed;
-    }
-    Ok(())
-}
-
-fn print_local(op: &Operation) {
-    println!(
-        "方向：{}\nhash：{}\n金额：{} CKB\n通道：{}\n当前状态：{:?}\n更新时间（Unix ms）：{}\n本地授权到期（Unix ms）：{}",
-        if op.inbound { "收款" } else { "付款" },
-        op.hash,
-        ckb(op.amount),
-        op.channel_id,
-        op.phase,
-        op.updated_at_ms,
-        op.authorization.expires_at_ms
-    );
-    if !op.inbound {
-        println!("费用上限：{} CKB", ckb(u128::from(op.max_fee)));
-    }
-    println!(
-        "最近推进时的远端状态：{}",
-        op.remote_status.as_deref().unwrap_or("未核对")
-    );
-    if let Some(error) = &op.remote_error {
-        println!("最近付款错误：{error}");
-    }
-    if op.phase != Phase::Complete
-        && let Some(progress) = &op.latest_progress
-    {
-        println!("最近保存的进度（可能已变化）：\n{progress}");
-    }
-    if op.phase == Phase::RemoteSuccess {
-        println!("远端成功，待本地核对");
-    }
-}
-pub async fn status(options: HashOptions, inbound: bool) -> Result<()> {
-    let config = Config::load(options.client.config.as_deref())?;
-    let (dir, _selection) =
-        crate::accounts::choose(&config.root, &options.client, false, false, false)?;
-    let account = ClientAccount::load_dir(&config, dir).await?;
-    let book = Book::load(&account)?;
-    let op = &book.operations[book.index(options.payment_hash)?];
-    ensure!(
-        op.inbound == inbound,
-        "hash 方向不符；请使用对应 invoice-status / payment-status"
-    );
-    print_local(op);
-    let rpc = Rpc::new(&config.rpc_url)?;
-    let result = async {
-        if inbound {
-            let result = lookup_invoice(&account, &rpc, op.hash)
-                .await?
-                .context("远端发票不存在")?;
-            validate_created(&account, op, &result.invoice_address, &result.invoice)?;
-            println!(
-                "本次远端原始状态：{:?}\n发票到期（Unix ms）：{}",
-                result.status,
-                invoice_deadline(&invoice(&result.invoice_address)?)?
-            );
-            println!("查询可能唤醒租户；投递进度只读，不签名或结算。");
-        } else {
-            let result = lookup_payment(&account, &rpc, op.hash)
-                .await?
-                .context("远端付款不存在，原发送结果需核对")?;
-            ensure!(
-                result.payment_hash == op.hash && result.fee <= u128::from(op.max_fee),
-                "远端付款 hash 或费用不匹配"
-            );
-            println!(
-                "本次远端原始状态：{:?}\n远端费用：{} CKB",
-                result.status,
-                ckb(result.fee)
-            );
-            if let Some(error) = result.failed_error {
-                println!("付款最近错误（不单独代表最终失败）：{error}");
-            }
-        }
-        match delivery_progress(&account, &rpc, op.hash).await {
-            Ok(Some(progress)) => println!("{}", describe_delivery(&progress)),
-            Ok(None) => println!("LSP 尚无本账户可见投递记录；不能据此判断付款结果"),
-            Err(error) => println!("LSP 投递进度未核对：{error:#}"),
-        }
-        Ok::<_, anyhow::Error>(())
-    }
-    .await;
-    println!("查询时间（Unix ms）：{}", now_ms()?);
-    if let Err(e) = result {
-        println!("远端未核对：{e:#}");
-    }
-    recovery(&account, op.hash, &options.client);
-    Ok(())
-}
-pub async fn list(options: crate::ClientOptions) -> Result<()> {
-    let config = Config::load(options.config.as_deref())?;
-    let (dir, _selection) = crate::accounts::choose(&config.root, &options, false, false, false)?;
-    let account = ClientAccount::load_dir(&config, dir).await?;
-    let book = Book::load(&account)?;
-    println!("本地收付款记录：{}（未查询远端）", book.operations.len());
-    for op in &book.operations {
-        print_local(op);
-        recovery(&account, op.hash, &options);
-    }
+    op.complete = true;
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::account::{
-        test_registered,
-        tests::{fixture, serve},
-    };
-    use fiber_types::Privkey;
-    use std::{fs, os::unix::fs::PermissionsExt};
-
-    #[test]
-    fn receipt_timing_starts_only_for_its_own_inbound_tlc_and_never_restarts() {
-        crate::timings::enable(true);
-        let hash = Hash256([1; 32]);
-        let mut receipt = ReceiptTiming::new(hash);
-        receipt.observe_tlc(Hash256([2; 32]), true);
-        receipt.observe_tlc(hash, false);
-        assert!(receipt.processing.is_none());
-        assert_eq!(crate::timings::calls("payment.wait_for_receipt"), 0);
-        receipt.observe_tlc(hash, true);
-        assert!(receipt.processing.is_some());
-        assert!(receipt.waiting.is_none());
-        assert_eq!(crate::timings::calls("payment.wait_for_receipt"), 1);
-        receipt.observe_tlc(hash, true);
-        assert_eq!(crate::timings::calls("payment.receipt_processing"), 0);
-        receipt.finish(true);
-        assert_eq!(crate::timings::calls("payment.receipt_processing"), 1);
-        crate::timings::enable(false);
-    }
-
-    #[tokio::test]
-    async fn event_wait_checks_channel_and_preserves_payment_authorization() {
-        let (_root, config, listener) = fixture();
-        let (account, book) = fixture_book(&config, true).await;
-        let id = book.operations[0].channel_id;
-        let before = fs::read(account.dir.path.join("payments.json")).unwrap();
-        let server = serve(
-            listener,
-            vec![
-                (
-                    "wait_channel_update",
-                    json!({ "channel_id": id, "revision": "0x1" }),
-                ),
-                (
-                    "wait_channel_update",
-                    json!({ "channel_id": id, "revision": "0x2" }),
-                ),
-                (
-                    "wait_channel_update",
-                    json!({ "channel_id": Hash256([9; 32]), "revision": "0x3" }),
-                ),
-                (
-                    "wait_channel_update",
-                    json!({ "error": {"code": -32601, "message": "Method not found"} }),
-                ),
-            ],
-        );
-        let rpc = Rpc::new(&config.rpc_url).unwrap();
-        assert_eq!(
-            wait_channel_update(&account, &rpc, id, None).await.unwrap(),
-            1
-        );
-        assert_eq!(
-            wait_channel_update(&account, &rpc, id, Some(1))
-                .await
-                .unwrap(),
-            2
-        );
-        assert!(
-            wait_channel_update(&account, &rpc, id, Some(2))
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("其他通道")
-        );
-        let error = wait_channel_update(&account, &rpc, id, Some(2))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("节点已升级"));
-        assert_eq!(
-            fs::read(account.dir.path.join("payments.json")).unwrap(),
-            before
-        );
-        server.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn delivery_query_checks_hash_and_never_mutates_local_authorization() {
-        let (_root, config, listener) = fixture();
-        let (account, book) = fixture_book(&config, true).await;
-        let hash = book.operations[0].hash;
-        let paths = ["payments.json", "signer.bin", "account.json"];
-        let before = paths.map(|path| fs::read(account.dir.path.join(path)).unwrap());
-        let mut progress = fiber_json_types::PaymentDeliveryProgress {
-            payment_hash: hash,
-            status: fiber_json_types::LspPaymentDeliveryStatus::Failed,
-            attempt_count: 2,
-            buffer_deadline: 123,
-            last_error: Some("Insufficient balance".into()),
-            failure_reason: Some("delivery expired".into()),
-        };
-        let valid = serde_json::to_value(&progress).unwrap();
-        progress.payment_hash = Hash256([9; 32]);
-        let server = serve(
-            listener,
-            vec![
-                ("get_payment_delivery", json!({"delivery": valid})),
-                ("get_payment_delivery", json!({"delivery": progress})),
-                ("get_payment_delivery", json!({"delivery": null})),
-            ],
-        );
-        let rpc = Rpc::new(&config.rpc_url).unwrap();
-        assert!(matches!(
-            delivery_progress(&account, &rpc, hash)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            fiber_json_types::LspPaymentDeliveryStatus::Failed
-        ));
-        assert!(delivery_progress(&account, &rpc, hash).await.is_err());
-        assert!(
-            delivery_progress(&account, &rpc, hash)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        server.join().unwrap();
-        for (path, content) in paths.into_iter().zip(before) {
-            assert_eq!(fs::read(account.dir.path.join(path)).unwrap(), content);
-        }
-    }
-
-    #[test]
-    fn delivery_feedback_distinguishes_retries_and_final_failure() {
-        let mut progress = fiber_json_types::PaymentDeliveryProgress {
-            payment_hash: Hash256([1; 32]),
-            status: fiber_json_types::LspPaymentDeliveryStatus::Deferred,
-            attempt_count: 2,
-            buffer_deadline: 123,
-            last_error: Some("Insufficient balance: available 0, required 100000000".into()),
-            failure_reason: None,
-        };
-        let message = describe_delivery(&progress);
-        assert!(message.contains("尚未最终失败"));
-        assert!(message.contains("Insufficient balance"));
-        progress.status = fiber_json_types::LspPaymentDeliveryStatus::Failed;
-        progress.failure_reason = Some("buffer deadline elapsed".into());
-        let message = describe_delivery(&progress);
-        assert!(message.contains("投递已失败"));
-        assert!(message.contains("发票本身未取消"));
-        assert!(message.contains("buffer deadline elapsed"));
-    }
-
-    async fn operation(account: &mut ClientAccount, inbound: bool) -> Operation {
-        // Bind a real SDK-derived channel key for the local record tests. Tests
-        // which sign commitments use the SDK's own cryptographic fixtures.
-        account.session.allocate_pending_channel().await.unwrap();
-        let id = fiber_types::Hash256::from([4; 32]);
-        let mut state = account.session.state().clone();
-        state
-            .bindings
-            .insert(id, account.session.pending_channel_key_id().unwrap());
-        // HostedSession owns the root; reload it with the persisted directory.
-        crate::account::save_test_state(&account.dir, &state);
-        let preimage = Hash256([5; 32]);
-        let hash = Hash256(HashAlgorithm::CkbHash.hash(preimage.0));
-        let expires = now_ms().unwrap() + 3_600_000;
-        Operation {
-            hash,
-            channel_id: id.into(),
-            inbound,
-            amount: u128::from(CKB),
-            max_fee: 0,
-            authorization: authorization(
-                hash,
-                inbound,
-                u128::from(CKB),
-                HashAlgorithm::CkbHash,
-                expires,
-            )
-            .unwrap(),
-            invoice: None,
-            preimage: inbound.then_some(preimage),
-            expiry_seconds: Some(3600),
-            creation_started: false,
-            send_started: false,
-            release_started: false,
-            cancellation_started: false,
-            phase: Phase::IntentSaved,
-            remote_status: None,
-            remote_error: None,
-            latest_progress: None,
-            updated_at_ms: now_ms().unwrap(),
-            start_versions: [1, 1],
-        }
-    }
-    fn signed_invoice(account: &ClientAccount, op: &Operation) -> InvoiceResult {
-        let mut parsed = CkbInvoice {
-            currency: Currency::Fibd,
-            amount: Some(op.amount),
-            signature: None,
-            data: fiber_types::InvoiceData {
-                timestamp: now_ms().unwrap().into(),
-                payment_hash: op.hash.into(),
-                attrs: vec![
-                    fiber_types::Attribute::ExpiryTime(Duration::from_secs(3600)),
-                    fiber_types::Attribute::HashAlgorithm(HashAlgorithm::CkbHash),
-                    fiber_types::Attribute::TrampolineRouteHint(
-                        secp256k1::PublicKey::from_slice(&account.lsp_public_key.0).unwrap(),
-                    ),
-                ],
-            },
-        };
-        // The test account's root backup is the registered invoice key.
-        let key = crate::store::read_private(&account.dir.path.join("root-key")).unwrap();
-        let key = secp256k1::SecretKey::from_slice(&key).unwrap();
-        parsed
-            .data
-            .attrs
-            .push(fiber_types::Attribute::PayeePublicKey(
-                Privkey::from(key.secret_bytes()).pubkey().into(),
-            ));
-        parsed
-            .update_signature(|message| secp256k1::SECP256K1.sign_ecdsa_recoverable(message, &key))
-            .unwrap();
-        InvoiceResult {
-            invoice_address: parsed.to_string(),
-            invoice: parsed.into(),
-        }
-    }
-    async fn fixture_book(config: &Config, inbound: bool) -> (ClientAccount, Book) {
-        let mut account = test_registered(config).await;
-        let op = operation(&mut account, inbound).await;
-        drop(account);
-        let account = ClientAccount::load(config, None).await.unwrap();
-        let mut book = Book::load(&account).unwrap();
-        book.operations.push(op);
-        book.save(&account.dir).unwrap();
-        (account, book)
-    }
-
-    #[tokio::test]
-    async fn lost_send_response_is_never_automatically_sent_again() {
-        let (_root, config, listener) = fixture();
-        let (account, mut book) = fixture_book(&config, false).await;
-        let result = signed_invoice(&account, &book.operations[0]);
-        book.operations[0].invoice = Some(result.invoice_address);
-        let hash = book.operations[0].hash;
-        book.save(&account.dir).unwrap();
-        let server = serve(
-            listener,
-            vec![
-                (
-                    "get_payment",
-                    json!({"error":{"code":-32000,"message":format!("InvalidParameter: Payment session not found: {hash}")}}),
-                ),
-                (
-                    "send_payment",
-                    json!({"error":{"code":-1,"message":"lost response containing secret-token"}}),
-                ),
-            ],
-        );
-        let rpc = Rpc::new(&config.rpc_url).unwrap();
-        assert!(send_once(&account, &rpc, &mut book, 0).await.is_err());
-        assert!(book.operations[0].send_started);
-        server.join().unwrap();
-        drop(account);
-        let account = ClientAccount::load(&config, None).await.unwrap();
-        let mut book = Book::load(&account).unwrap();
-        // No server remains: this succeeds only if no duplicate RPC is sent.
-        send_once(&account, &rpc, &mut book, 0).await.unwrap();
-        assert_eq!(book.operations[0].hash, hash);
-        assert_eq!(
-            fs::metadata(account.dir.path.join("payments.json"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-
-    #[tokio::test]
-    async fn lost_creation_response_looks_up_the_same_hash_and_secret() {
-        let (_root, config, listener) = fixture();
-        let (account, mut book) = fixture_book(&config, true).await;
-        let result = signed_invoice(&account, &book.operations[0]);
-        let preimage = book.operations[0].preimage;
-        let hash = book.operations[0].hash;
-        let server = serve(
-            listener,
-            vec![
-                ("new_invoice", json!({"error":{"code":-1,"message":"lost"}})),
-                (
-                    "get_invoice",
-                    json!({"invoice_address":result.invoice_address,"invoice":result.invoice,"status":"Open"}),
-                ),
-            ],
-        );
-        let rpc = Rpc::new(&config.rpc_url).unwrap();
-        assert!(ensure_invoice(&account, &rpc, &mut book, 0).await.is_err());
-        drop(account);
-        let account = ClientAccount::load(&config, None).await.unwrap();
-        let mut book = Book::load(&account).unwrap();
-        ensure_invoice(&account, &rpc, &mut book, 0).await.unwrap();
-        assert_eq!(book.operations[0].hash, hash);
-        assert_eq!(book.operations[0].preimage, preimage);
-        assert_eq!(
-            book.operations[0].invoice.as_deref(),
-            Some(result.invoice_address.as_str())
-        );
-        server.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn malformed_created_invoice_keeps_original_secret_and_creation_marker() {
-        let (_root, config, listener) = fixture();
-        let (account, mut book) = fixture_book(&config, true).await;
-        let mut result = signed_invoice(&account, &book.operations[0]);
-        result.invoice.amount = Some(2 * u128::from(CKB));
-        let server = serve(
-            listener,
-            vec![("new_invoice", serde_json::to_value(result).unwrap())],
-        );
-        let rpc = Rpc::new(&config.rpc_url).unwrap();
-        assert!(ensure_invoice(&account, &rpc, &mut book, 0).await.is_err());
-        assert!(book.operations[0].creation_started && book.operations[0].invoice.is_none());
-        assert!(book.operations[0].preimage.is_some());
-        server.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn query_failure_does_not_write_records_or_authorize_any_signature() {
-        let (_root, config, listener) = fixture();
-        let (account, mut book) = fixture_book(&config, true).await;
-        let result = signed_invoice(&account, &book.operations[0]);
-        book.operations[0].invoice = Some(result.invoice_address);
-        book.save(&account.dir).unwrap();
-        let paths = ["payments.json", "signer.bin", "account.json"];
-        let before = paths.map(|p| fs::read(account.dir.path.join(p)).unwrap());
-        let server = serve(
-            listener,
-            vec![(
-                "get_invoice",
-                json!({"error":{"code":-1,"message":"secret-preimage"}}),
-            )],
-        );
-        let rpc = Rpc::new(&config.rpc_url).unwrap();
-        assert!(
-            lookup_invoice(&account, &rpc, book.operations[0].hash)
-                .await
-                .is_err()
-        );
-        server.join().unwrap();
-        for (p, content) in paths.into_iter().zip(before) {
-            assert_eq!(fs::read(account.dir.path.join(p)).unwrap(), content);
-        }
-    }
-
-    #[test]
-    fn cli_requires_explicit_amount_fee_and_wait_for_timeout() {
-        use clap::Parser;
-        assert!(crate::Cli::try_parse_from(["lsp-cli", "pay", "invoice"]).is_err());
-        assert!(
-            crate::Cli::try_parse_from(["lsp-cli", "pay", "invoice", "--max-fee", "0", "-u", "1"])
-                .is_ok()
-        );
-        assert!(crate::Cli::try_parse_from(["lsp-cli", "create-invoice"]).is_err());
-        assert!(
-            crate::Cli::try_parse_from([
-                "lsp-cli",
-                "create-invoice",
-                "--amount",
-                "1",
-                "--timeout",
-                "1"
-            ])
-            .is_err()
-        );
-        assert!(
-            crate::Cli::try_parse_from([
-                "lsp-cli",
-                "create-invoice",
-                "--amount",
-                "1",
-                "--wait",
-                "-u",
-                "1",
-                "--timeout",
-                "1"
-            ])
-            .is_ok()
-        );
-        assert!(
-            authorization(Hash256([1; 32]), true, 1, HashAlgorithm::CkbHash, u64::MAX).is_err()
-        );
-    }
-    #[tokio::test]
-    async fn trampoline_fee_and_restored_authorization_cannot_drift() {
-        let (_root, config, _listener) = fixture();
-        let (account, mut book) = fixture_book(&config, false).await;
-        book.operations[0].max_fee = 1_000_000;
-        book.operations[0].authorization.amount += 1_000_000;
-        let result = signed_invoice(&account, &book.operations[0]);
-        book.operations[0].invoice = Some(result.invoice_address);
-        book.save(&account.dir).unwrap();
-        let loaded = Book::load(&account).unwrap();
-        let params = payment_params(&account, &loaded.operations[0]).unwrap();
-        assert_eq!(params[0]["max_fee_amount"], "0xf4240");
-        assert_eq!(params[0]["max_fee_rate"], "0xa");
-        assert_eq!(params[0]["max_parts"], "0x1");
-        assert_eq!(
-            params[0]["trampoline_hops"],
-            json!([account.lsp_public_key])
-        );
-        // No network timeout is passed from the CLI's local wait timeout.
-        assert!(params[0].get("timeout").is_none());
-        book.operations[0].max_fee += 1;
-        book.save(&account.dir).unwrap();
-        assert!(Book::load(&account).is_err());
-    }
-
-    #[tokio::test]
-    async fn wrong_channel_signing_response_never_mutates_sdk_or_submits() {
-        let (_root, config, listener) = fixture();
-        let (mut account, mut book) = fixture_book(&config, false).await;
-        let id = book.operations[0].channel_id;
-        let server = serve(
-            listener,
-            vec![(
-                "get_channel_signing_status",
-                json!({
-                    "channel_id": Hash256([7;32]), "status": {"type":"NoSignatureRequired"}
-                }),
-            )],
-        );
-        let before = fs::read(account.dir.path.join("signer.bin")).unwrap();
-        let rpc = Rpc::new(&config.rpc_url).unwrap();
-        let error = sign(&mut account, &rpc, &mut book, id, None)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("其他通道"));
-        assert_eq!(
-            fs::read(account.dir.path.join("signer.bin")).unwrap(),
-            before
-        );
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn fee_budget_is_bound_to_single_part_trampoline_parameters() {
-        assert_eq!(parse_fee("0").unwrap(), 0);
-        assert_eq!(parse_fee("0.001").unwrap(), 100_000);
-        assert!(parse_fee("-1").is_err());
-    }
-}
+#[path = "test_payments.rs"]
+mod tests;

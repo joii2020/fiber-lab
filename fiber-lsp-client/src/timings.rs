@@ -202,11 +202,11 @@ fn human_report(metrics: &BTreeMap<String, Metric>, success: bool) -> String {
         show(&mut out, "payment.send", "  提交付款");
         show(
             &mut out,
-            "rpc.lsp.wait_channel_update",
+            "payment.poll_wait",
             if receipt {
-                "  LSP 事件等待（含等待付款）"
+                "  轮询间隔等待（含等待付款）"
             } else {
-                "  等待 LSP 事件"
+                "  轮询间隔等待"
             },
         );
         show(&mut out, "payment.external_sign", "  外部签名流程");
@@ -215,7 +215,6 @@ fn human_report(metrics: &BTreeMap<String, Metric>, success: bool) -> String {
             "payment.sdk_prepare_confirm",
             "    SDK 校验与签名",
         );
-        show(&mut out, "payment.replay_persist", "    保存签名恢复资料");
         show(
             &mut out,
             "rpc.lsp.get_channel_signing_status",
@@ -235,7 +234,7 @@ fn human_report(metrics: &BTreeMap<String, Metric>, success: bool) -> String {
         }
         show(&mut out, "payment.reconcile", "  完成状态与余额核对");
         if receipt {
-            out.push_str("收款处理从本次首次观察到入账 TLC 起计时，包含后续协议等待；恢复命令仅统计本次推进。\n");
+            out.push_str("收款处理从本次首次观察到入账 TLC 起计时，包含后续协议等待。\n");
         }
         out.push_str("阶段存在包含关系，请勿逐项相加。\n");
     } else {
@@ -265,59 +264,5 @@ pub fn calls(name: &str) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn receipt_latency_keeps_protocol_wait_and_does_not_subtract_all_event_waits() {
-        let mut metrics = BTreeMap::new();
-        for (name, total_us) in [
-            ("cli.total", 11_000_000),
-            ("payment.wait_for_receipt", 10_000_000),
-            ("payment.receipt_processing", 1_000_000),
-            ("payment.receipt_protocol_wait", 400_000),
-            ("rpc.lsp.wait_channel_update", 10_400_000),
-        ] {
-            metrics.insert(
-                name.into(),
-                Metric {
-                    calls: 1,
-                    total_us,
-                    ..Default::default()
-                },
-            );
-        }
-        let report = human_report(&metrics, true);
-        assert!(report.contains("收款处理耗时：1.000 秒"));
-        assert!(report.contains("其中协议等待：400.0 毫秒"));
-        assert!(report.contains("等待付款（不计入收款处理）：10.000 秒"));
-        assert!(report.contains("命令运行时间（含等待付款）：11.000 秒"));
-        metrics
-            .get_mut("payment.receipt_processing")
-            .unwrap()
-            .errors = 1;
-        assert!(human_report(&metrics, true).contains("收款处理耗时（尚未完成）"));
-        metrics.remove("payment.receipt_processing");
-        assert!(human_report(&metrics, true).contains("尚未观察到入账 TLC"));
-    }
-    #[test]
-    fn disabled_and_rpc_outcomes() {
-        enable(false);
-        drop(Span::new("disabled"));
-        STATE.with_borrow(|s| assert!(s.metrics.is_empty()));
-        enable(true);
-        let mut success = Span::rpc("lsp", "success");
-        success.finish(true);
-        drop(success);
-        let mut failed = Span::rpc("ckb", "failed");
-        failed.finish(false);
-        drop(failed);
-        drop(Span::rpc("lsp", "wait_channel_update"));
-        STATE.with_borrow(|s| {
-            assert_eq!(s.metrics["rpc.lsp.success"].calls, 1);
-            assert_eq!(s.metrics["rpc.ckb.failed"].errors, 1);
-            assert_eq!(s.metrics["rpc.lsp.wait_channel_update"].cancelled, 1);
-        });
-        enable(false);
-    }
-}
+#[path = "test_timings.rs"]
+mod tests;

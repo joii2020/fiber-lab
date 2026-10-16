@@ -1,6 +1,6 @@
 # fiber-lab
 
-本地 Fiber LSP 联调环境，使用 `lsp-cli` 创建、恢复客户端账户，开通、查询和协作关闭 CKB 私有通道，以及收付款和离线恢复。
+本地 Fiber LSP 联调环境，使用 `lsp-cli` 创建、恢复客户端账户，开通、查询和协作关闭 CKB 私有通道，以及双方在线的单笔收付款。
 
 按下文可以跑完当前已实现的流程：**准备环境 → 生成管理凭证 → 启动 LSP → 注册账户 → 开通道 → 查询通道 → 协作关闭 → 停止或重启**。账户间在线收付款已通过当前本地 devnet 验证；离线与故障恢复仍需分别验证，完整流程及限制见 [收付款流程](docs/payment-flow.md)。
 
@@ -24,7 +24,7 @@ Fiber 源码默认放在同级目录 `../fiber`，必须包含 LSP 实现和 `cr
 ./scripts/build-fiber.sh
 ```
 
-成功后，`./lsp-cli --help` 会列出 `admin`、`accounts`、`status`、`create-channel`、`close-channel`，以及 `pay`、`create-invoice`、`watch`、`resume`、`payment-status`、`invoice-status` 和 `list-payments`。
+成功后，`./lsp-cli --help` 会列出 `admin`、`accounts`、`status`、`create-channel`、`close-channel`，以及 `pay` 和 `create-invoice`。
 更换 Fiber 源码目录的方式见 [编译与本地依赖](docs/devnet.md#编译与本地依赖)。
 
 ### 2. 初始化节点
@@ -136,75 +136,43 @@ curl --noproxy '*' -fsS http://127.0.0.1:21716 \
 ./lsp-cli close-channel -u 1 --round 1  # 核对历史关闭结果
 ```
 
-日常操作必须显式选择固定账户 `-u N`。status、close-channel、resume、payment-status、invoice-status、list-payments 可加 `--round R` 选择该账户的历史轮次；轮次从 1 开始，按清单内创建顺序编号，包括当前轮次，只有已归档轮次允许通过历史入口操作。历史选择不切换当前轮次，并持有同一账户锁。当前轮次直接用 `-u N`；pay、create-invoice、watch、create-channel 不允许选择历史轮次。兼容旧数据的 `--account ID` 入口仍保留，与 `-u N`、`--round R` 互斥。无通道关闭不归档，未结算 TLC、退款校验失败或链上未确认也不归档。同账户命令互斥，新开通另有全局锁，四账户链上开通串行。
+日常操作必须显式选择固定账户 `-u N`。status、close-channel 可加 `--round R` 选择该账户的历史轮次；轮次从 1 开始，按清单内创建顺序编号，包括当前轮次，只有已归档轮次允许通过历史入口操作。历史选择不切换当前轮次，并持有同一账户锁。当前轮次直接用 `-u N`；pay、create-invoice、create-channel 不允许选择历史轮次。兼容旧数据的 `--account ID` 入口仍保留，与 `-u N`、`--round R` 互斥。无通道关闭不归档，未结算 TLC、退款校验失败或链上未确认也不归档。同账户命令互斥，新开通另有全局锁，四账户链上开通串行。
 
 历史直接保留在 `.state/fiber-lsp-client/` 下，通过清单关联固定账户与各轮内部身份；沿用已有目录，无需迁移。保留 `accounts.json` 及完整身份目录，包含 root-key、signer.bin、account.json、channel.json、payments.json；归档不移动或删除这些文件，也不注销服务端租户。清单结构损坏拒绝继续；单账户摘要异常在列表单独显示。详情见 [客户端账户](docs/client-account.md)。
 
-### 7. 收付款及离线恢复
+### 7. 双方在线的 1v1 收付款
 
-收付款命令加 `--timings` 可在结束时查看中文分阶段耗时：准备、事件等待、SDK 签名、签名恢复资料保存、状态刷新、收款结算及最终核对。磁盘写入和 fsync 另列，注明已包含在阶段耗时中；单张发票的收款摘要优先显示“收款处理耗时”，从本次首次观察到匹配 hash 的入账 TLC 开始，到收款核对结束，保留其中的协议等待；“等待付款”单列，不计入该处理时间。命令运行时间仍保留，不能扣除全部 LSP 等待来计算收款延迟；resume 仅统计本次恢复推进。摘要写入 stderr，原收付款输出保持原位置。自动程序使用 `--timings-json` 获取原完整 JSON；两个选项互斥，均不包含请求内容。Rust 基准入口的 `--timings` 会自动选择 CLI 的 JSON 模式。
+当前只实现经典在线场景：A 创建一张发票并保持运行，B 支付该发票，双方持续在线直到各自报告完成。每个账户一次只推进本次操作，不批量处理历史收付款。`watch`、`resume`、`payment-status`、`invoice-status`、`list-payments` 已移除。
 
-当前多用户开关、退款及账户间在线收付款已通过真实 devnet 验证。在线付款要求同级 Fiber 的 `get_payment` 在 TLC 移除签名前返回已校验、已持久化的本租户 preimage；本次验证使用工作区已有的该修改。旧版本可能在 TLC 移除时拒签并随后 ACK 超时强关；离线、重启及故障恢复仍需单独验证。
-
-前台等待改用 LSP 的 `wait_channel_update` HTTP 长轮询：`create-invoice --wait`、`pay`、`watch` 和 `resume` 在状态变化时立即继续签名及结算，不再每轮固定等待 500ms。没有变化时服务端挂起请求，最多 5 秒返回一次以便补查；这不是每步等待 5 秒。退出命令后不保留后台监听，账户锁和原有恢复方式保持不变。不带 `--wait` 的 `create-invoice` 仍在输出发票后退出。
-
-需要同时重新编译 Fiber 节点和 CLI，并在节点使用新二进制启动后使用等待命令。旧节点不支持新接口时会明确报错，保留原 hash 与恢复资料，不自动重发付款。已启动的节点不会因编译自动升级；无需清理已有运行数据。实际支付耗时需分别测量余额更新及双方结算完成，不承诺固定毫秒数。
-
-2026-10-14 使用新版 Release 节点和 CLI，沿用现有通道完成账户 2 → 账户 1 的 1 CKB devnet 支付：从启动付款 CLI 计时，收款 CLI 完成（远端状态、SDK TLC 移除及余额核对）约 691ms，付款 CLI 完成约 970ms；付款 hash 为 `0x491d4b05a49cf68a80a8fb813ff6da93b43323bbf8f8e3b1e793e23723a94025`。这是一次端到端实测，包含 CLI 启动、外部签名、持久化和结算核对，不是 Fiber 协议的独立延迟基准。
-
-账户之间互付只需双方各有一条到 LSP 的私有通道，并有对应方向的可用余额；付款方本方余额覆盖金额及费用，收款方 LSP 一侧余额覆盖发票金额。新初始化默认双方各注入 1000 CKB。与普通节点互付时，另外准备普通节点到 LSP 的通道和对应流动性。命令不会自动连接节点、开通道或补充现有通道资金。
+双方需各有一条到 LSP 的私有通道。付款方本方可用余额须覆盖金额及费用，收款方 LSP 一侧可用余额须覆盖发票金额。命令不会自动开通道或补充资金。
 
 ```bash
-# 普通节点先生成有签名的 devnet 固定金额发票，将地址传入
-./lsp-cli pay '<普通节点 invoice_address>' --max-fee 0.01 --timeout 120 -u 1
+# 先串行准备通道并核对余额；已有通道可以复用
+./lsp-cli create-channel -u 1
+./lsp-cli create-channel -u 2
+./lsp-cli status -u 1
+./lsp-cli status -u 2
 
-# 在线收款：先输出可分享地址，然后前台签名及结算
-./lsp-cli create-invoice --amount 1 --expiry 3600 --wait --timeout 120 -u 1
+# 终端 A：输出 invoice_address 后保持运行，等待这一笔收款完成
+./lsp-cli create-invoice -u 1 --amount 1 --expiry 3600
 
-# 离线演示：输出发票后退出，停止本账户其他推进进程，对端随后付款
-./lsp-cli create-invoice --amount 1 --expiry 3600 -u 1
-# 在 TLC 有效恢复窗口内重新上线；不应等待对端成功后才上线
-./lsp-cli resume --payment-hash 0x... --timeout 120 -u 1
-# 或持续推进所有本账户已授权操作
-./lsp-cli watch -u 1
-
-./lsp-cli payment-status --payment-hash 0x... -u 1
-./lsp-cli invoice-status --payment-hash 0x... -u 1
-./lsp-cli list-payments -u 1
+# 终端 B：复制上面的完整地址并付款，保持运行直到完成
+./lsp-cli pay -u 2 '<invoice_address>' --timeout 120
 ```
 
+`create-invoice` 必须指定金额，发票有效期默认 3600 秒；创建后直接等待收款，不再使用 `--wait`。可用 `--timeout 120` 限制等待时间，默认一直等待。`pay` 使用 Fiber 默认费用预算（当前为金额的 0.5%，向上取整到 shannon），不提供费用参数，默认等待 120 秒；trampoline 可能花费完整费用预算。两条命令仅接受 `-u N` 当前轮次，并支持 `--config PATH`，不提供 `--account` 和 `--round` 参数。
 
-账户间在线收付款使用两个终端。先串行开通双方通道并查询余额，然后让收款终端保持运行：
+快速测试：`./scripts/test_send_and_pay.sh` 使用已开通通道的账户 1 收款、账户 2 付款，金额 1 CKB、使用 Fiber 默认费用预算（0.005 CKB）；结束后输出双方日志和耗时。脚本不会清理或重建环境。
 
-```bash
-./lsp-cli create-channel -u 3
-./lsp-cli create-channel -u 4
-./lsp-cli status -u 3
-./lsp-cli status -u 4
+收付款期间每轮等待 500ms 后继续查询、签名和结算。SDK 校验本地授权及 commitment，收款在完整恢复签名、链上 live funding 和安全窗口检查通过后释放 preimage；只有远端 `Paid` / `Success`、SDK 双 lane TLC 移除和余额核对完成后才报告成功。
 
-# 终端 A：输出 invoice_address 后保持运行
-./lsp-cli create-invoice -u 3 --amount 1 --expiry 3600 --wait
-# 终端 B：复制上面的完整地址，由账户 4 支付
-./lsp-cli pay -u 4 '<invoice_address>' --max-fee 0.01 --timeout 120
-```
+付款依赖同级 Fiber 的 `get_payment` 在 TLC 移除签名前提供可核验 preimage。需要使用包含该修改的 Fiber 节点；已启动的节点不会因重新编译自动升级。
 
-快速测试可直接执行 `./scripts/test_send_and_pay.sh`（无需参数，账户 1、2 需已开通通道且余额充足）：账户 1 创建金额为 1、有效期为 3600 秒的发票并等待收款，脚本自动提取 `invoice_address` 交给账户 2 付款，费用上限 0.01、付款超时 120 秒。两边均启用 `--timings`，结束后先输出收款日志，再输出付款日志，每段以 `------` 分隔。
+收付款业务状态、preimage 和待提交签名只保存在本次进程内存中，不读写 `payments.json`，不额外保存账户 session；旧付款文件保留。账户、通道及 SDK 底层签名存储继续沿用。超时、Ctrl-C 或 RPC 错误会以失败退出，不自动重试或重发；退出不取消网络付款，也不能恢复本次内存状态。远端已有同一 hash 的付款时拒绝再次发送。
 
-收款端 Ctrl-C 后需在另一个终端 `resume -u 3 --payment-hash 0x...` 或 `watch -u 3`，付款端也需保持推进；只恢复付款端不能替收款端签名和结算。
+2026-10-16 沿用现有通道验证：账户 2 向账户 1 支付 1 CKB，双方均完成结算与余额核对，旧 `payments.json` 内容哈希保持不变。付款 hash：`0xeb57b09fb6c2c6b80f5a83161d82db0d630d6d34a8dbb7e5b17e7d1b1f81dc1a`。
 
-`pay`、`create-invoice --wait`、`resume`、`watch` 会显示远端状态、通道可用余额，以及 LSP 暂存、转发、结算、成功或失败的进度和原因。投递接口每 5 秒查询，状态变化时提示，无变化时每 15 秒提示仍在等待；超时或中断显示最后核对的进度及恢复命令。`Deferred` 和最近错误表示仍可重试，不能等同最终付款失败；`SettlingUpstream` 表示上游 TLC 尚在结算。最终付款失败仍需核对 TLC 清理和余额。收款端遇到最终投递失败停止本次等待，但不取消发票，不推断其他付款结果。付款端若投递已失败而付款 RPC 仍为 `Inflight`，明确停止本次等待并提示上游结果、TLC 清理和余额待核对；不把一次投递失败当作整笔付款终态，也不据此授权取消。
-
-`invoice-status`、`payment-status` 同样展示最新投递进度。用户凭证调用 `get_payment_delivery`，只能查看自己作为收款人或由其绑定通道付出的 delivery；不读取管理 token，不暴露对端租户、通道或原像。无可见记录不能证明没有付款到达。旧节点不支持接口时明确提示未核对，不把查询错误当作付款失败。原发票、付款 hash、授权及运行数据继续保留；不要因超时重复支付或清理环境。
-
-所有命令支持 `--config PATH`；仅 resume、payment-status、invoice-status、list-payments 支持互斥 `--account ID` 历史入口。`pay` 首次必须指定费用上限，trampoline 可能用完整费用预算；恢复不能修改金额或费用。付款等待默认 120 秒。`create-invoice` 必须显式指定金额，发票有效期默认 3600 秒；不带 `--wait` 时输出后退出，带 `--wait` 时默认持续等待，`--timeout` 仅允许与 `--wait` 一起使用。等待超时或 Ctrl-C 只停止本次推进，不取消网络付款或发票；保留原 hash 和恢复资料。
-
-`Success` / `Paid` 是远端证据；只有 SDK 双 commitment lane 的 TLC 移除及余额核对完成才报告付款 / 收款完成。发送响应丢失时保留“结果未知”，恢复只查原 hash，不自动再次发送。收款秘密在本地保存，仅通过 SDK 完整恢复证明、链上 live funding 和恢复窗口检查后释放。查询不签名、释放秘密或发送付款；普通用户的发票和付款查询可能唤醒租户；投递进度查询本身不唤醒租户，且仅返回本人参与的投递摘要。
-
-CLI 退出只是客户端停止签名，不保证 LSP 私有通道离线，也不承诺长期离线期间最终到账。LSP 暂存付款需要 LSP 持续运行；真实通道离线通过显式管理操作构造。账户锁使同账户一次仅能运行一个命令，`watch` / `--wait` 在线时需先停止它再查询。实际离线、超时及重启场景尚未通过验收，历史记录可通过 Git 查询。
-
-本次验证（2026-10-14）：保留已有 U1、U2 及其原付款记录，在 U3、U4 各开一条双方注入 1000 CKB 的新通道，初始双方可用余额各 900 CKB。U4→U3、U3→U4 分别支付 1 CKB，费用均为 0.01 CKB；双方均报告收付款完成，远端为 `Paid` / `Success`，SDK 双 lane TLC 移除及余额完成核对，最终 U3、U4 本方可用余额均为 899.99 CKB。付款 hash 分别为 `0xee73aee1ea90c8fe8d66de9d4e3a8938a70139f9a407f92351da680c5e3a22a7`、`0xe3e12566ee2019245d116d876dfee9a4d08bb574c0be56cbe12d8acea1568496`。
-
-原 U1、U2 的余额不足付款现在可从双方用户接口看到 `Insufficient balance` 和最终投递失败原因；原付款 RPC 仍为 `Inflight`，U2 通道已被服务端非协作关闭，不能继续链下恢复，TLC 清理及链上结算未完成核对，资料继续保留。它不属于本次双向成功验证，也不能仅凭 `accounts` 的 `ready` 认定已退款。
+收付款命令可加 `--timings` 查看分阶段耗时；“等待付款”与“收款处理耗时”分别统计，处理过程中的协议等待仍计入后者。`--timings-json` 提供机器可读计时，两者互斥。
 
 ### 8. 停止和重启
 
@@ -231,5 +199,5 @@ bash scripts/clean.sh
 - [devnet 与节点管理](docs/devnet.md)：本地编译、节点分工、启动脚本、端口和运行数据。
 - [Biscuit 凭证](docs/biscuit-auth.md)：公私钥、管理凭证、RPC 鉴权和用户凭证。
 - [客户端账户](docs/client-account.md)：SDK 身份、注册过程、存储和恢复。
-- [通道与收付款流程](docs/payment-flow.md)：已实现的通道生命周期，以及收付款、前台推进与离线恢复。
+- [通道与收付款流程](docs/payment-flow.md)：已实现的通道生命周期，以及双方在线的单笔收付款。
 - [故障排查](docs/troubleshooting.md)：启动、RPC、账户问题与出资账户核对。
