@@ -127,6 +127,10 @@ impl Rpc {
         })
     }
 
+    pub fn subscribe_events(&self, token: &str) -> Result<crate::events::EventStream> {
+        crate::events::EventStream::connect(&self.url, token)
+    }
+
     pub async fn call<R: DeserializeOwned>(
         &self,
         method: &str,

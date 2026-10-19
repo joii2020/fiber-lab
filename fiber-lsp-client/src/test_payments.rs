@@ -277,24 +277,131 @@ async fn payment_leaves_fee_parameters_to_fiber() {
 
 #[tokio::test]
 async fn wrong_channel_signing_response_never_mutates_sdk_or_submits() {
-    let (_root, config, listener) = fixture();
+    let (_root, config, _listener) = fixture();
     let (mut account, mut op) = fixture_operation(&config, false).await;
-    let server = serve(
-        listener,
-        vec![(
-            "get_channel_signing_status",
-            json!({
-                "channel_id": Hash256([7;32]), "status": {"type":"NoSignatureRequired"}
-            }),
-        )],
-    );
+    let request = GetChannelSigningStatusResult {
+        channel_id: Hash256([7; 32]),
+        status: ChannelSigningStatus::NoSignatureRequired,
+    };
     let before = fs::read(account.dir.path.join("signer.bin")).unwrap();
     let rpc = Rpc::new(&config.rpc_url).unwrap();
-    let error = sign(&mut account, &rpc, &mut op, None).await.unwrap_err();
+    let error = sign(&mut account, &rpc, &mut op, request, None)
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("其他通道"));
     assert_eq!(
         fs::read(account.dir.path.join("signer.bin")).unwrap(),
         before
     );
-    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn sse_wakes_driver_and_silent_stream_still_polls_payment_status() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::Notify,
+    };
+
+    for send_signature in [true, false] {
+        let (_root, config, listener) = fixture();
+        let (mut account, mut op) = fixture_operation(&config, false).await;
+        let remote = crate::channel::tests::prepare_payment_channel(&mut account).await;
+        let hash = op.hash;
+        let polls = Arc::new(AtomicUsize::new(0));
+        let server_polls = polls.clone();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let server = tokio::spawn(async move {
+            let first_poll = Arc::new(Notify::new());
+            let mut handlers = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (mut socket, _) = accepted.unwrap();
+                        let first_poll = first_poll.clone();
+                        let polls = server_polls.clone();
+                        let remote = remote.clone();
+                        handlers.spawn(async move {
+                            let mut bytes = Vec::new();
+                            while !bytes.ends_with(b"\r\n\r\n") {
+                                bytes.push(socket.read_u8().await.unwrap());
+                            }
+                            let headers = String::from_utf8(bytes).unwrap().to_lowercase();
+                            assert!(headers.contains("authorization: bearer user-test-token"));
+                            if headers.starts_with("get /lsp/events ") {
+                                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Lsp-Session-Id: 0123456789abcdef0123456789abcdef\r\nConnection: close\r\n\r\ndata: {\"version\":1,\"type\":\"lsp.snapshot_complete\"}\n\n").await.unwrap();
+                                if send_signature {
+                                    first_poll.notified().await;
+                                    let event = fiber_json_types::LspEventEnvelope {
+                                        version: 1,
+                                        event: LspEvent::ChannelSignatureRequired(Box::new(GetChannelSigningStatusResult {
+                                            channel_id: Hash256([7;32]),
+                                            status: ChannelSigningStatus::NoSignatureRequired,
+                                        })),
+                                    };
+                                    socket.write_all(format!("data: {}\n\n", serde_json::to_string(&event).unwrap()).as_bytes()).await.unwrap();
+                                }
+                                let mut byte = [0];
+                                assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+                                return true;
+                            }
+                            let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length: ")).unwrap().parse().unwrap();
+                            let mut body = vec![0; length];
+                            socket.read_exact(&mut body).await.unwrap();
+                            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                            let result = match request["method"].as_str().unwrap() {
+                                "list_channels" => json!({"channels": [remote]}),
+                                "get_payment" => {
+                                    let count = polls.fetch_add(1, Ordering::SeqCst) + 1;
+                                    json!({"payment_hash": hash, "status": if !send_signature && count >= 3 {"Failed"} else {"Created"}, "fee":"0x0", "failed_error":"fixture failure", "created_at":"0x1", "last_updated_at":"0x1", "routers":[]})
+                                }
+                                method => panic!("unexpected RPC: {method}"),
+                            };
+                            let body = json!({"jsonrpc":"2.0", "id":request["id"], "result":result}).to_string();
+                            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                            if request["method"] == "get_payment" {
+                                first_poll.notify_one();
+                            }
+                            false
+                        });
+                    }
+                    result = handlers.join_next(), if !handlers.is_empty() => {
+                        if result.unwrap().unwrap() {
+                            while let Some(result) = handlers.join_next().await {
+                                result.unwrap();
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let rpc = Rpc::new(&config.rpc_url).unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            drive(&mut account, &rpc, &mut op, None),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        if send_signature {
+            assert!(error.to_string().contains("其他通道"), "{error:#}");
+            assert_eq!(
+                polls.load(Ordering::SeqCst),
+                2,
+                "event must wake the driver before the next poll"
+            );
+        } else {
+            assert!(error.to_string().contains("fixture failure"), "{error:#}");
+            assert_eq!(polls.load(Ordering::SeqCst), 3);
+        }
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }

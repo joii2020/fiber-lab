@@ -10,7 +10,7 @@ use clap::Args;
 use fiber_json_types::{
     Channel, ChannelSigningStatus, ChannelSigningTransition, ChannelState, CkbInvoiceStatus,
     GetChannelSigningStatusResult, GetInvoiceResult, GetPaymentCommandResult, Hash256,
-    InvoiceResult, NewInvoiceParams, PaymentStatus, SubmitChannelSignatureParams,
+    InvoiceResult, LspEvent, NewInvoiceParams, PaymentStatus, SubmitChannelSignatureParams,
 };
 use fiber_lsp_sdk::{
     PaymentAuthorization, ProcessOutcome, RecoveryRecord, SigningPolicy, SubmitParams,
@@ -178,6 +178,7 @@ async fn ready_channel(account: &ClientAccount, rpc: &Rpc, id: Hash256) -> Resul
 
 pub async fn pay(options: PayOptions) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.pay");
+    crate::timings::start_payment();
     let client = crate::ClientOptions::from(options.client);
     let (dir, _selection) =
         crate::accounts::choose(&crate::accounts::root(), &client, false, false, false)?;
@@ -230,12 +231,15 @@ pub async fn pay(options: PayOptions) -> Result<()> {
     };
     println!("付款 hash：{hash}\nFiber 默认费用预算：{} CKB", ckb(fee));
     register(&account, &op).await?;
+    crate::timings::payment_step("authorized", "账户就绪，发票、余额校验及付款授权完成");
     send_payment(&account, &rpc, &op).await?;
+    crate::timings::payment_step("sent", "send_payment 返回，付款已提交");
     wait(&mut account, &rpc, &mut op, Some(options.timeout)).await
 }
 
 pub async fn create_invoice(options: InvoiceOptions) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.invoice");
+    crate::timings::start_payment();
     let client = crate::ClientOptions::from(options.client);
     let (dir, _selection) =
         crate::accounts::choose(&crate::accounts::root(), &client, false, false, false)?;
@@ -281,9 +285,14 @@ pub async fn create_invoice(options: InvoiceOptions) -> Result<()> {
         start_versions: versions(&records),
     };
     register(&account, &op).await?;
+    crate::timings::payment_step("authorized", "账户就绪，秘密生成及收款授权完成");
     create_remote_invoice(&account, &rpc, &mut op).await?;
     print_invoice(&op);
     std::io::stdout().flush()?;
+    crate::timings::payment_step(
+        "invoice_ready",
+        "hold invoice 创建、校验并输出完成，开始等待付款",
+    );
     wait(&mut account, &rpc, &mut op, options.timeout).await
 }
 
@@ -470,19 +479,50 @@ async fn drive(
     let _timing = crate::timings::Span::new("payment.drive");
     let (id, wallet, local_reserve, remote_reserve) = channel::payment_context(account)?;
     ensure!(op.channel_id == id, "收付款属于其他通道");
+    let mut events = rpc.subscribe_events(token(account)?)?;
+    let mut poll = tokio::time::interval(Duration::from_millis(500));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        let delivery = {
+            let _protocol_wait = receipt
+                .as_ref()
+                .filter(|receipt| receipt.processing.is_some())
+                .map(|_| crate::timings::Span::new("payment.receipt_protocol_wait"));
+            let _event_wait = crate::timings::Span::new("payment.event_wait");
+            tokio::select! {
+                delivery = events.next() => Some(delivery?),
+                _ = poll.tick() => None,
+            }
+        };
+        let request = match delivery {
+            Some(delivery) => match delivery.event {
+                LspEvent::ChannelSignatureRequired(request) => Some((*request, delivery.processed)),
+                LspEvent::SnapshotComplete | LspEvent::WatchtowerSignatureRequired(_) => {
+                    let _ = delivery.processed.send(true);
+                    continue;
+                }
+            },
+            None => None,
+        };
         ready_channel(account, rpc, id).await?;
+        // Fulfillment authorization must be refreshed before signing TLC removal.
         refresh(account, rpc, op).await?;
-        sign(account, rpc, op, receipt.as_deref_mut()).await?;
+        if let Some((request, processed)) = request {
+            sign(account, rpc, op, request, receipt.as_deref_mut()).await?;
+            let _ = processed.send(true);
+        }
         release(account, rpc, op, &wallet).await?;
-        let remote = ready_channel(account, rpc, id).await?;
-        let records = account
-            .session
-            .channel_signer(id.into())
-            .await?
-            .recovery_records()
-            .await?;
-        reconcile(op, &records, &remote, local_reserve, remote_reserve)?;
+        if op.succeeded {
+            let records = account
+                .session
+                .channel_signer(id.into())
+                .await?
+                .recovery_records()
+                .await?;
+            // A signature or preimage submission may have changed remote balances.
+            let remote = ready_channel(account, rpc, id).await?;
+            reconcile(op, &records, &remote, local_reserve, remote_reserve)?;
+        }
         if op.complete {
             println!(
                 "{}完成（远端状态、SDK TLC 移除及余额已核对）\n付款 hash：{}\n金额：{} CKB",
@@ -492,12 +532,6 @@ async fn drive(
             );
             return Ok(());
         }
-        let _protocol_wait = receipt
-            .as_ref()
-            .filter(|receipt| receipt.processing.is_some())
-            .map(|_| crate::timings::Span::new("payment.receipt_protocol_wait"));
-        let _poll_wait = crate::timings::Span::new("payment.poll_wait");
-        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 async fn refresh(account: &ClientAccount, rpc: &Rpc, op: &mut Operation) -> Result<()> {
@@ -514,11 +548,17 @@ async fn refresh(account: &ClientAccount, rpc: &Rpc, op: &mut Operation) -> Resu
         validate_created(account, op, &remote.invoice_address, &remote.invoice)?;
 
         match remote.status {
-            CkbInvoiceStatus::Paid => op.succeeded = true,
+            CkbInvoiceStatus::Paid => {
+                op.succeeded = true;
+                crate::timings::payment_step("remote_success", "观察到发票 Paid");
+            }
             CkbInvoiceStatus::Expired | CkbInvoiceStatus::Cancelled => {
                 bail!("发票已过期或取消；当前版本不支持中断恢复，未继续结算");
             }
-            CkbInvoiceStatus::Received => op.received = true,
+            CkbInvoiceStatus::Received => {
+                op.received = true;
+                crate::timings::payment_step("received", "观察到发票 Received");
+            }
             _ => {}
         }
     } else if let Some(remote) = lookup_payment(account, rpc, op.hash).await? {
@@ -536,11 +576,13 @@ async fn refresh(account: &ClientAccount, rpc: &Rpc, op: &mut Operation) -> Resu
             signer
                 .authorize_fulfillment(op.hash.into(), preimage.into())
                 .await?;
+            crate::timings::payment_step("fulfillment", "取得并验证 preimage，授权 TLC 结算完成");
         }
         match remote.status {
             PaymentStatus::Success => {
                 ensure!(op.preimage.is_some(), "远端成功但缺少可核验 preimage");
                 op.succeeded = true;
+                crate::timings::payment_step("remote_success", "观察到付款 Success");
             }
             PaymentStatus::Failed => {
                 bail!(
@@ -560,23 +602,22 @@ async fn sign(
     account: &mut ClientAccount,
     rpc: &Rpc,
     op: &mut Operation,
+    result: GetChannelSigningStatusResult,
     receipt: Option<&mut ReceiptTiming>,
 ) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.external_sign");
     let id = op.channel_id;
-    let result: GetChannelSigningStatusResult = rpc
-        .call(
-            "get_channel_signing_status",
-            json!([{ "channel_id": id }]),
-            token(account)?,
-        )
-        .await?;
     ensure!(result.channel_id == id, "签名请求属于其他通道");
+    let mut contains_tlc = false;
     if let ChannelSigningStatus::SignatureRequired {
         settlement: Some(settlement),
         ..
     } = &result.status
     {
+        contains_tlc = settlement
+            .tlcs
+            .iter()
+            .any(|tlc| tlc.payment_hash == op.hash);
         ensure!(
             settlement
                 .tlcs
@@ -656,6 +697,9 @@ async fn sign(
     let _: serde_json::Value = rpc
         .call("submit_channel_signature", json!([params]), token(account)?)
         .await?;
+    if contains_tlc {
+        crate::timings::payment_step("tlc_signed", "首次完成包含本次 TLC 的签名提交");
+    }
     Ok(())
 }
 async fn release(
@@ -687,6 +731,10 @@ async fn release(
     {
         return Ok(());
     }
+    crate::timings::payment_step(
+        "commitment_ready",
+        "本地承诺已包含入账 TLC，完整恢复签名就绪",
+    );
     let preimage = op.preimage.context("缺少本地收款秘密")?;
     // Verify live funding and the safety window immediately before release.
     signer
@@ -697,6 +745,10 @@ async fn release(
             wallet,
         )
         .await?;
+    crate::timings::payment_step(
+        "release_authorized",
+        "funding 与安全时间窗口检查通过，允许释放秘密",
+    );
     let _: serde_json::Value = rpc
         .call(
             "settle_invoice",
@@ -705,6 +757,7 @@ async fn release(
         )
         .await?;
     op.release_started = true;
+    crate::timings::payment_step("released", "settle_invoice 返回，秘密已提交");
     Ok(())
 }
 fn reconcile(
@@ -745,6 +798,7 @@ fn reconcile(
         return Ok(());
     }
     op.complete = true;
+    crate::timings::payment_step("complete", "双 lane TLC 接受、移除及最终余额核对完成");
     Ok(())
 }
 

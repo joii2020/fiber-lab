@@ -1171,4 +1171,4 @@ pub fn settled_balances(records: &[fiber_lsp_sdk::RecoveryRecord]) -> Result<(u1
 
 #[cfg(test)]
 #[path = "test_channel.rs"]
-mod tests;
+pub(crate) mod tests;

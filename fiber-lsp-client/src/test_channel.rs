@@ -728,3 +728,10 @@ async fn explicit_foreign_channel_is_rejected_without_signing_or_shutdown() {
     );
     server.join().unwrap();
 }
+
+// Reuse the opening fixture for payment-driver tests without exposing Intent.
+pub(crate) async fn prepare_payment_channel(account: &mut ClientAccount) -> Channel {
+    let record = intent(account).await;
+    save_intent(&account.dir, &record).unwrap();
+    channel_projection(&record)
+}

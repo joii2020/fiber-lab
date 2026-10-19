@@ -2,6 +2,7 @@ mod account;
 mod accounts;
 mod admin;
 mod channel;
+mod events;
 mod payments;
 mod rpc;
 mod store;

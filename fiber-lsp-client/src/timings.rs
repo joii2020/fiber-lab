@@ -1,5 +1,10 @@
 //! Opt-in, payload-free timings for the current-thread CLI runtime.
-use std::{cell::RefCell, collections::BTreeMap, fmt::Write, time::Instant};
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    fmt::Write,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use serde::Serialize;
 
@@ -16,6 +21,17 @@ struct Metric {
 struct State {
     enabled: bool,
     metrics: BTreeMap<String, Metric>,
+    payment_start: Option<Instant>,
+    payment_started_unix_us: Option<u128>,
+    steps: Vec<PaymentStep>,
+}
+
+#[derive(Serialize)]
+struct PaymentStep {
+    id: &'static str,
+    label: &'static str,
+    elapsed_us: u128,
+    since_previous_us: u128,
 }
 thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
 
@@ -26,6 +42,77 @@ pub fn enable(enabled: bool) {
             ..State::default()
         }
     });
+}
+
+pub fn start_payment() {
+    STATE.with_borrow_mut(|state| {
+        if state.enabled {
+            state.payment_start = Some(Instant::now());
+            state.payment_started_unix_us = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_micros());
+            state.steps.clear();
+        }
+    });
+}
+
+/// Record the first local observation only; polling and SSE replay must not
+/// move a milestone or turn it into another timing interval.
+pub fn payment_step(id: &'static str, label: &'static str) {
+    STATE.with_borrow_mut(|state| {
+        let Some(start) = state.payment_start else {
+            return;
+        };
+        if state.steps.iter().any(|step| step.id == id) {
+            return;
+        }
+        let elapsed_us = start.elapsed().as_micros();
+        let previous = state.steps.last().map_or(0, |step| step.elapsed_us);
+        state.steps.push(PaymentStep {
+            id,
+            label,
+            elapsed_us,
+            since_previous_us: elapsed_us.saturating_sub(previous),
+        });
+    });
+}
+
+fn payment_report(state: &State, success: bool) -> String {
+    let Some(start) = state.payment_start else {
+        return String::new();
+    };
+    let mut out = String::from("\n收付款时序（本端观察，本次时间 / 总共耗时）\n");
+    let role = if state.metrics.contains_key("payment.invoice") {
+        "收款"
+    } else {
+        "付款"
+    };
+    for (i, step) in state.steps.iter().enumerate() {
+        writeln!(
+            &mut out,
+            "[{}]\t[{role}]\t{:.1}ms\t{:.1}ms\t{}",
+            i + 1,
+            step.since_previous_us as f64 / 1_000.0,
+            step.elapsed_us as f64 / 1_000.0,
+            step.label,
+        )
+        .unwrap();
+    }
+    if !success {
+        let previous = state.steps.last().map_or(0, |step| step.elapsed_us);
+        let elapsed = start.elapsed().as_micros();
+        writeln!(
+            &mut out,
+            "[{}]\t[{role}]\t{:.1}ms\t{:.1}ms\t未完成，停止推进",
+            state.steps.len() + 1,
+            elapsed.saturating_sub(previous) as f64 / 1_000.0,
+            elapsed as f64 / 1_000.0,
+        )
+        .unwrap();
+    }
+    out.push_str("区间包含 RPC、签名和协议等待；收款端等待付款也包含人工复制发票时间。\n");
+    out
 }
 
 pub struct Span {
@@ -88,9 +175,14 @@ pub fn report(success: bool, json: bool) {
                     "schema": 1, "unit": "us", "success": success,
                     "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
                     "metrics": state.metrics,
+                    "payment_steps": state.steps,
+                    "payment_elapsed_us": state.payment_start.map(|start| start.elapsed().as_micros()),
+                    "payment_started_unix_us": state.payment_started_unix_us,
+                    "human_report": format!("{}{}", payment_report(state, success), human_report(&state.metrics, success)),
                 })
             );
         } else {
+            eprint!("{}", payment_report(state, success));
             eprint!("{}", human_report(&state.metrics, success));
         }
     });
@@ -202,11 +294,11 @@ fn human_report(metrics: &BTreeMap<String, Metric>, success: bool) -> String {
         show(&mut out, "payment.send", "  提交付款");
         show(
             &mut out,
-            "payment.poll_wait",
+            "payment.event_wait",
             if receipt {
-                "  轮询间隔等待（含等待付款）"
+                "  事件或状态查询等待（含等待付款）"
             } else {
-                "  轮询间隔等待"
+                "  事件或状态查询等待"
             },
         );
         show(&mut out, "payment.external_sign", "  外部签名流程");
@@ -214,11 +306,6 @@ fn human_report(metrics: &BTreeMap<String, Metric>, success: bool) -> String {
             &mut out,
             "payment.sdk_prepare_confirm",
             "    SDK 校验与签名",
-        );
-        show(
-            &mut out,
-            "rpc.lsp.get_channel_signing_status",
-            "    获取待签请求",
         );
         show(
             &mut out,
