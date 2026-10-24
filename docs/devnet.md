@@ -28,6 +28,8 @@
 
 创建脚本要求 Node3 目录与管理 token 均不存在，已有环境时提前退出，避免 offckb 重写 Node3 配置。`clean.sh` 成功后可再次运行创建脚本；创建脚本不会自动清理任何数据。
 
+`admin init-lsp` 在 `rpc.ws_listening_addr` 缺失或为空时设置为 `127.0.0.1:21717`，已有自定义值保留。该监听提供收付款使用的 WebSocket 签名订阅，原 HTTP RPC 监听不提供该订阅。已有环境升级需重新运行 `admin init-lsp` 或手动补齐此字段，再重启升级后的 LSP；已有密钥、链及账户数据保留。使用自定义地址时，同步修改 `scripts/config.sh` 的 `WS_URL`，手工收付款命令通过 `--ws-url` 指定。
+
 配置完成后，offckb 只管理 Node1、Node2；Shell 单独启动 Node3，复用其已有配置、密码和密钥。
 
 | 服务 | RPC | Fiber P2P | offckb CKB 账户 |
@@ -36,6 +38,7 @@
 | 普通 Fiber Node1 | `http://127.0.0.1:21714` | `8344` | `#3` |
 | 普通 Fiber Node2 | `http://127.0.0.1:21715` | `8345` | `#4` |
 | LSP / Node3（Public T） | `http://127.0.0.1:21716` | `8346` | `#5` |
+| LSP 签名订阅 | `ws://127.0.0.1:21717` | — | — |
 | 客户端 lsp-cli | 连接 Node3 RPC | — | `#6` |
 
 ## 启动与停止脚本

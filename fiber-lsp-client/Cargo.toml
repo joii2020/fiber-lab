@@ -27,3 +27,8 @@ secp256k1 = { version = "0.30", features = ["recovery", "global-context"] }
 hex = "0.4"
 rand = "0.9"
 toml = "0.8"
+jsonrpsee = { version = "0.25.1", features = ["ws-client", "client-ws-transport-tls"] }
+
+[dev-dependencies]
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-tungstenite = "0.28"

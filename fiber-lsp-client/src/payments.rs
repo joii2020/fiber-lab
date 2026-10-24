@@ -10,7 +10,8 @@ use clap::Args;
 use fiber_json_types::{
     Channel, ChannelSigningStatus, ChannelSigningTransition, ChannelState, CkbInvoiceStatus,
     GetChannelSigningStatusResult, GetInvoiceResult, GetPaymentCommandResult, Hash256,
-    InvoiceResult, LspEvent, NewInvoiceParams, PaymentStatus, SubmitChannelSignatureParams,
+    InvoiceResult, NewInvoiceParams, PaymentStatus, SubmitChannelSignatureParams,
+    SubscriptionEvent,
 };
 use fiber_lsp_sdk::{
     PaymentAuthorization, ProcessOutcome, RecoveryRecord, SigningPolicy, SubmitParams,
@@ -179,6 +180,7 @@ async fn ready_channel(account: &ClientAccount, rpc: &Rpc, id: Hash256) -> Resul
 pub async fn pay(options: PayOptions) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.pay");
     crate::timings::start_payment();
+    let ws_url = options.client.ws_url.clone();
     let client = crate::ClientOptions::from(options.client);
     let (dir, _selection) =
         crate::accounts::choose(&crate::accounts::root(), &client, false, false, false)?;
@@ -234,12 +236,15 @@ pub async fn pay(options: PayOptions) -> Result<()> {
     crate::timings::payment_step("authorized", "账户就绪，发票、余额校验及付款授权完成");
     send_payment(&account, &rpc, &op).await?;
     crate::timings::payment_step("sent", "send_payment 返回，付款已提交");
-    wait(&mut account, &rpc, &mut op, Some(options.timeout)).await
+    println!("付款已提交，等待结算");
+    std::io::stdout().flush()?;
+    wait(&mut account, &rpc, &ws_url, &mut op, Some(options.timeout)).await
 }
 
 pub async fn create_invoice(options: InvoiceOptions) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.invoice");
     crate::timings::start_payment();
+    let ws_url = options.client.ws_url.clone();
     let client = crate::ClientOptions::from(options.client);
     let (dir, _selection) =
         crate::accounts::choose(&crate::accounts::root(), &client, false, false, false)?;
@@ -293,7 +298,7 @@ pub async fn create_invoice(options: InvoiceOptions) -> Result<()> {
         "invoice_ready",
         "hold invoice 创建、校验并输出完成，开始等待付款",
     );
-    wait(&mut account, &rpc, &mut op, options.timeout).await
+    wait(&mut account, &rpc, &ws_url, &mut op, options.timeout).await
 }
 
 fn validate_created(
@@ -401,11 +406,12 @@ impl ReceiptTiming {
 async fn wait(
     account: &mut ClientAccount,
     rpc: &Rpc,
+    ws_url: &str,
     op: &mut Operation,
     timeout: Option<u64>,
 ) -> Result<()> {
     let mut receipt = op.inbound.then(|| ReceiptTiming::new(op.hash));
-    let future = drive(account, rpc, op, receipt.as_mut());
+    let future = drive(account, rpc, ws_url, op, receipt.as_mut());
     let deadline = async {
         if let Some(seconds) = timeout {
             tokio::time::sleep(Duration::from_secs(seconds)).await;
@@ -473,13 +479,14 @@ async fn send_payment(account: &ClientAccount, rpc: &Rpc, op: &Operation) -> Res
 async fn drive(
     account: &mut ClientAccount,
     rpc: &Rpc,
+    ws_url: &str,
     op: &mut Operation,
     mut receipt: Option<&mut ReceiptTiming>,
 ) -> Result<()> {
     let _timing = crate::timings::Span::new("payment.drive");
     let (id, wallet, local_reserve, remote_reserve) = channel::payment_context(account)?;
     ensure!(op.channel_id == id, "收付款属于其他通道");
-    let mut events = rpc.subscribe_events(token(account)?)?;
+    let mut events = crate::events::EventStream::connect(ws_url, token(account)?, id)?;
     let mut poll = tokio::time::interval(Duration::from_millis(500));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -496,8 +503,13 @@ async fn drive(
         };
         let request = match delivery {
             Some(delivery) => match delivery.event {
-                LspEvent::ChannelSignatureRequired(request) => Some((*request, delivery.processed)),
-                LspEvent::SnapshotComplete | LspEvent::WatchtowerSignatureRequired(_) => {
+                SubscriptionEvent::ChannelSigning(request) => Some((*request, delivery.processed)),
+                SubscriptionEvent::Removed { channel_id } => {
+                    ensure!(channel_id != id, "收付款通道已从签名订阅中移除");
+                    let _ = delivery.processed.send(true);
+                    continue;
+                }
+                SubscriptionEvent::WatchtowerSigning(_) => {
                     let _ = delivery.processed.send(true);
                     continue;
                 }

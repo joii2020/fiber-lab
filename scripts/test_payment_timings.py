@@ -69,11 +69,16 @@ class PaymentTimingsTests(unittest.TestCase):
         self.assertIn("结果：未全部完成", output)
 
     def test_missing_or_old_report_is_not_reported_as_success(self):
-        for receive in ["错误：账户不存在", 'timings {"success": true}']:
+        for receive, reason in [
+            ("错误：账户不存在", "未生成计时报告"),
+            ('timings {"success": true}', "缺少共同时间基准"),
+        ]:
             with self.subTest(receive=receive):
                 output, success = merged_report(receive, "")
                 self.assertFalse(success)
-                self.assertIn("缺少共同时间基准", output)
+                self.assertIn(f"[收款方 A] {reason}", output)
+                self.assertIn("[付款方 B] 未生成计时报告", output)
+                self.assertNotIn("[付款方 B] 缺少共同时间基准", output)
                 self.assertIn("没有可合并的步骤", output)
 
 

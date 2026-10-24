@@ -8,3 +8,4 @@ FIBER_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/offckb-nodejs/devnet/fiber"
 LSP_DIR="$FIBER_DIR/nodes/3"
 
 RPC_URL="http://127.0.0.1:21716"
+WS_URL="ws://127.0.0.1:21717"

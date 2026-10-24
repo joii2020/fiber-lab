@@ -38,7 +38,11 @@ def merged_report(receive_log, pay_log):
             message if message.startswith("[") and "\t" in message else f"[{role}] {message}"
             for message in messages
         )
-        if report is None or report.get("payment_started_unix_us") is None:
+        if report is None:
+            out.append(f"[{role}] 未生成计时报告（该端未启动或提前退出），无法合并该端时序")
+            complete = False
+            continue
+        if report.get("payment_started_unix_us") is None:
             out.append(f"[{role}] 缺少共同时间基准，无法合并该端时序；请重新编译客户端")
             complete = False
             continue

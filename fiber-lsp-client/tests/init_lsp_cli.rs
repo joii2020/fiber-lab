@@ -117,6 +117,7 @@ fn fresh_init_preserves_node_settings_and_creates_usable_keys_and_token() {
         updated["rpc"]["listening_addr"],
         original["rpc"]["listening_addr"]
     );
+    assert_eq!(updated["rpc"]["ws_listening_addr"], "127.0.0.1:21717");
     assert_eq!(
         updated["rpc"]["biscuit_private_key_path"].as_str().unwrap(),
         fixture.private.to_str().unwrap()
@@ -178,6 +179,7 @@ fn existing_relative_private_path_is_reused_and_made_absolute() {
         .extend(["lsp".into(), "pubsub".into()]);
     config["rpc"]["biscuit_public_key"] = key.public().to_string().into();
     config["rpc"]["biscuit_private_key_path"] = "custom-key".into();
+    config["rpc"]["ws_listening_addr"] = "127.0.0.1:21800".into();
     fs::write(&fixture.config, serde_yaml::to_string(&config).unwrap()).unwrap();
     assert!(fixture.run().status.success());
     let updated = fixture.document();
@@ -186,6 +188,7 @@ fn existing_relative_private_path_is_reused_and_made_absolute() {
         custom.to_str().unwrap()
     );
     assert_eq!(updated["services"], config["services"]);
+    assert_eq!(updated["rpc"]["ws_listening_addr"], "127.0.0.1:21800");
     assert_eq!(
         updated["rpc"]["enabled_modules"],
         config["rpc"]["enabled_modules"]

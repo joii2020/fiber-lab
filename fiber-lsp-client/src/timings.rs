@@ -57,7 +57,7 @@ pub fn start_payment() {
     });
 }
 
-/// Record the first local observation only; polling and SSE replay must not
+/// Record the first local observation only; polling and subscription replay must not
 /// move a milestone or turn it into another timing interval.
 pub fn payment_step(id: &'static str, label: &'static str) {
     STATE.with_borrow_mut(|state| {

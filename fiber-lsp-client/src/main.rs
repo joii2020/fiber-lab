@@ -98,6 +98,9 @@ struct CurrentClientOptions {
     /// 固定账户编号 1～4（当前轮次）
     #[arg(short = 'u', long, value_parser = clap::value_parser!(u8).range(1..=4))]
     user: u8,
+    /// LSP 独立 WebSocket RPC 地址，对应 rpc.ws_listening_addr
+    #[arg(long, default_value = "ws://127.0.0.1:21717", value_name = "URL", value_parser = events::parse_url)]
+    ws_url: String,
     #[command(flatten)]
     connection: ConnectionOptions,
 }

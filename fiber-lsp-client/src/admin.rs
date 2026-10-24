@@ -79,6 +79,9 @@ pub fn init_lsp(options: &InitLsp) -> Result<InitializedLsp> {
         &["lsp", "pubsub"],
         "rpc.enabled_modules",
     )?;
+    if optional_string(rpc, "ws_listening_addr")?.is_none() {
+        rpc.insert("ws_listening_addr".into(), "127.0.0.1:21717".into());
+    }
     let public_text = optional_string(rpc, "biscuit_public_key")?;
     let public = public_text
         .map(|text| {

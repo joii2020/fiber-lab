@@ -1,98 +1,102 @@
-//! SSE transport with bounded buffering and reconnect/snapshot recovery.
+//! Bounded WebSocket signing subscriptions with pending-request replay on reconnect.
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-use fiber_json_types::{LspEvent, LspEventEnvelope};
+use anyhow::{Context, Result};
+use fiber_json_types::{Hash256, SubscriptionEvent, SubscriptionOptions, SubscriptionTopic};
+use jsonrpsee::{
+    client_transport::ws::WsHandshakeError,
+    core::client::{Error, SubscriptionClientT},
+    rpc_params,
+    ws_client::{HeaderMap, HeaderValue, PingConfig, WsClientBuilder},
+};
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
-const MAX_EVENT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_EVENT_BYTES: u32 = 10 * 1024 * 1024;
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
-const SESSION_HEADER: &str = "x-lsp-session-id";
 
 enum StreamEnd {
     Reconnect,
-    Replaced,
     TokenRejected,
+    SubscriptionRejected(i32),
 }
 
 /// One event is acknowledged after verification and signature submission.
 pub struct EventDelivery {
-    /// Typed request or snapshot boundary from the authenticated stream.
-    pub event: LspEvent,
+    pub event: SubscriptionEvent,
     /// Send false on failure to reconnect and recover outstanding requests.
     pub processed: oneshot::Sender<bool>,
 }
 
-/// A new stream takes over the tenant's signer session. Reconnects resume it;
-/// replacement by another stream stops automatic retries.
-/// Dropping this stream cancels the request and any pending reconnect.
+/// Each connection has its own subscription. Dropping the reader cancels it,
+/// including any connection attempt, pending delivery, or reconnect delay.
 pub struct EventStream {
     receiver: mpsc::Receiver<Result<EventDelivery>>,
     task: tokio::task::JoinHandle<()>,
 }
 
+pub fn parse_url(value: &str) -> Result<String> {
+    let url = reqwest::Url::parse(value).context("LSP WebSocket URL 无效")?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "ws" | "wss")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "LSP WebSocket URL 必须为不含凭证、查询参数和片段的 WS(S) 地址"
+    );
+    Ok(url.into())
+}
+
 impl EventStream {
-    pub(crate) fn connect(rpc_url: &str, token: &str) -> Result<Self> {
+    pub(crate) fn connect(ws_url: &str, token: &str, channel_id: Hash256) -> Result<Self> {
+        let url = parse_url(ws_url)?;
         let token = Zeroizing::new(token.to_owned());
-        let mut url = reqwest::Url::parse(rpc_url)?;
-        url.set_path("/lsp/events");
-        url.set_query(None);
-        url.set_fragment(None);
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(60))
-            .build()?;
+        let mut auth = HeaderValue::from_str(&format!("Bearer {}", token.as_str()))
+            .map_err(|_| anyhow::anyhow!("用户凭证无法用于 WebSocket 请求头"))?;
+        auth.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", auth);
+        let builder = WsClientBuilder::default()
+            .set_headers(headers)
+            // jsonrpsee counts the initial handshake in this limit.
+            .max_redirections(1)
+            .connection_timeout(Duration::from_secs(10))
+            .request_timeout(Duration::from_secs(10))
+            .max_response_size(MAX_EVENT_BYTES)
+            .max_buffer_capacity_per_subscription(32)
+            .enable_ws_ping(PingConfig::default());
         let (sender, receiver) = mpsc::channel(1);
         let task = tokio::spawn(async move {
             let mut backoff = Duration::from_millis(500);
-            let mut session_id = None;
             loop {
                 let started = Instant::now();
-                let mut retry_after = Duration::ZERO;
-                let result = receive(
-                    &client,
-                    &url,
-                    &token,
-                    &sender,
-                    &mut retry_after,
-                    &mut session_id,
-                )
-                .await;
+                let result = receive(&builder, &url, channel_id, &sender).await;
                 if sender.is_closed() {
                     break;
                 }
-                match result {
-                    Ok(StreamEnd::Replaced) => {
-                        let _ = sender
-                            .send(Err(anyhow::anyhow!(
-                                "LSP 签名会话已被其他客户端接管；停止本次收付款推进"
-                            )))
-                            .await;
-                        break;
-                    }
-                    Ok(StreamEnd::TokenRejected) => {
-                        let _ = sender
-                            .send(Err(anyhow::anyhow!(
-                                "LSP 拒绝 SSE 用户凭证；停止本次收付款推进"
-                            )))
-                            .await;
-                        break;
-                    }
-                    Err(_) => {
-                        // Do not include HTTP errors or event payloads in diagnostics.
-                        eprintln!("LSP SSE 连接中断，稍后重连并获取待签名快照");
-                    }
-                    Ok(StreamEnd::Reconnect) => {}
+                let terminal = match result {
+                    Ok(StreamEnd::TokenRejected) => Some(anyhow::anyhow!(
+                        "LSP 拒绝 WebSocket 用户凭证；停止本次收付款推进"
+                    )),
+                    Ok(StreamEnd::SubscriptionRejected(code)) => Some(anyhow::anyhow!(
+                        "LSP 拒绝 WebSocket channel_signing 订阅（code {code}）；请检查独立 WS 地址、通道和用户凭证的 subscriptions / channels 权限；旧租户凭证需由服务端重新签发"
+                    )),
+                    _ => None,
+                };
+                if let Some(error) = terminal {
+                    let _ = sender.send(Err(error)).await;
+                    break;
                 }
-                // A briefly accepted connection must not reset a failing retry loop.
+                // Never include transport errors or signing payloads in diagnostics.
+                eprintln!("LSP WebSocket 订阅中断，稍后重连并重新订阅待签名请求");
                 if started.elapsed() >= Duration::from_secs(30) {
                     backoff = Duration::from_millis(500);
                 }
-                let delay = reconnect_delay(backoff, retry_after, rand::random());
+                let half = (backoff.as_millis() as u64 / 2).max(1);
+                let delay = Duration::from_millis(half + rand::random::<u64>() % (half + 1));
                 tokio::select! {
                     _ = sender.closed() => break,
                     _ = tokio::time::sleep(delay) => {}
@@ -103,12 +107,11 @@ impl EventStream {
         Ok(Self { receiver, task })
     }
 
-    /// Wait for the next tenant event, including pending work replayed after reconnect.
     pub async fn next(&mut self) -> Result<EventDelivery> {
         self.receiver
             .recv()
             .await
-            .context("LSP SSE 事件读取已停止")?
+            .context("LSP WebSocket 事件读取已停止")?
     }
 }
 
@@ -118,297 +121,54 @@ impl Drop for EventStream {
     }
 }
 
-fn reconnect_delay(backoff: Duration, retry_after: Duration, random: u64) -> Duration {
-    let half = (backoff.as_millis() as u64 / 2).max(1);
-    retry_after + Duration::from_millis(half + random % (half + 1))
-}
-
 async fn receive(
-    client: &reqwest::Client,
-    url: &reqwest::Url,
-    token: &str,
+    builder: &WsClientBuilder,
+    url: &str,
+    channel_id: Hash256,
     sender: &mpsc::Sender<Result<EventDelivery>>,
-    retry_after: &mut Duration,
-    session_id: &mut Option<String>,
 ) -> Result<StreamEnd> {
-    let mut request = client
-        .get(url.clone())
-        .bearer_auth(token)
-        .header("accept", "text/event-stream");
-    if let Some(id) = session_id.as_ref() {
-        request = request.header(SESSION_HEADER, id);
-    }
-    let mut response = request.send().await?;
-    match response.status() {
-        reqwest::StatusCode::CONFLICT => return Ok(StreamEnd::Replaced),
-        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+    let client = match builder.clone().build(url).await {
+        Ok(client) => client,
+        Err(Error::Transport(error))
+            if matches!(
+                error.downcast_ref::<WsHandshakeError>(),
+                Some(WsHandshakeError::Rejected {
+                    status_code: 401 | 403
+                })
+            ) =>
+        {
             return Ok(StreamEnd::TokenRejected);
         }
-        _ => {}
-    }
-    if let Some(seconds) = response
-        .headers()
-        .get("retry-after")
-        .and_then(|header| header.to_str().ok())
-        .and_then(|header| header.parse::<u64>().ok())
+        Err(error) => return Err(error.into()),
+    };
+    let options = SubscriptionOptions {
+        channel_ids: Some(vec![channel_id]),
+    };
+    let mut subscription = match client
+        .subscribe::<SubscriptionEvent, _>(
+            "subscribe",
+            rpc_params![SubscriptionTopic::ChannelSigning, options],
+            "unsubscribe",
+        )
+        .await
     {
-        *retry_after = Duration::from_secs(seconds.min(300));
-    }
-    if !response.status().is_success() {
-        bail!("HTTP {} from tenant event endpoint", response.status());
-    }
-    anyhow::ensure!(
-        response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.split(';').next() == Some("text/event-stream")),
-        "expected text/event-stream"
-    );
-    let received_session = response
-        .headers()
-        .get(SESSION_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .filter(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .context("missing or invalid LSP session ID")?;
-    anyhow::ensure!(
-        session_id.as_ref().is_none_or(|id| id == received_session),
-        "LSP session changed during resume"
-    );
-    *session_id = Some(received_session.to_owned());
-    let mut decoder = Decoder::default();
-    while let Some(chunk) = response.chunk().await? {
-        decoder.push(&chunk)?;
-        while let Some(data) = decoder.next_data()? {
-            let value: serde_json::Value =
-                serde_json::from_str(&data).context("invalid SSE JSON")?;
-            // Future tenant event types can share the stream without breaking this signer.
-            if !matches!(
-                value["type"].as_str(),
-                Some(
-                    "lsp.channel.signature_required"
-                        | "lsp.watchtower.signature_required"
-                        | "lsp.snapshot_complete"
-                )
-            ) {
-                continue;
-            }
-            let envelope: LspEventEnvelope = serde_json::from_value(value)?;
-            anyhow::ensure!(envelope.version == 1, "unsupported LSP event version");
-            let (processed, reply) = oneshot::channel();
-            sender
-                .send(Ok(EventDelivery {
-                    event: envelope.event,
-                    processed,
-                }))
-                .await?;
-            if !reply.await.unwrap_or(false) {
-                bail!("signer could not process event; replay pending work on reconnect");
-            }
+        Ok(subscription) => subscription,
+        Err(Error::Call(error)) => return Ok(StreamEnd::SubscriptionRejected(error.code())),
+        Err(error) => return Err(error.into()),
+    };
+    // The server sends pending requests first, then current state changes. There
+    // is no session header, historical cursor, or snapshot-complete event.
+    while let Some(event) = subscription.next().await {
+        let event = event?;
+        let (processed, reply) = oneshot::channel();
+        sender.send(Ok(EventDelivery { event, processed })).await?;
+        if !reply.await.unwrap_or(false) {
+            break;
         }
     }
     Ok(StreamEnd::Reconnect)
 }
 
-#[derive(Default)]
-struct Decoder {
-    buffer: Vec<u8>,
-}
-
-impl Decoder {
-    fn push(&mut self, chunk: &[u8]) -> Result<()> {
-        anyhow::ensure!(
-            self.buffer.len() + chunk.len() <= MAX_EVENT_BYTES,
-            "SSE frame too large"
-        );
-        self.buffer.extend_from_slice(chunk);
-        Ok(())
-    }
-
-    fn next_data(&mut self) -> Result<Option<String>> {
-        loop {
-            let Some((end, separator)) = self
-                .buffer
-                .windows(2)
-                .position(|bytes| bytes == b"\n\n")
-                .map(|end| (end, 2))
-                .into_iter()
-                .chain(
-                    self.buffer
-                        .windows(4)
-                        .position(|bytes| bytes == b"\r\n\r\n")
-                        .map(|end| (end, 4)),
-                )
-                .min_by_key(|(end, _)| *end)
-            else {
-                return Ok(None);
-            };
-            let frame: Vec<_> = self.buffer.drain(..end + separator).collect();
-            let text = std::str::from_utf8(&frame)?;
-            let data: Vec<_> = text
-                .lines()
-                .filter_map(|line| {
-                    line.strip_prefix("data:")
-                        .map(|data| data.strip_prefix(' ').unwrap_or(data))
-                })
-                .collect();
-            if !data.is_empty() {
-                return Ok(Some(data.join("\n")));
-            }
-        }
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fragmented_sse_heartbeats_crlf_and_multiline_data() {
-        let mut decoder = Decoder::default();
-        decoder
-            .push(b": heartbeat\r\n\r\nevent: lsp.test\r\ndata: {\r\nda")
-            .unwrap();
-        assert!(decoder.next_data().unwrap().is_none());
-        decoder
-            .push("ta: \"name\":\"签名\"}\r\n\r\ndata: second\n\n".as_bytes())
-            .unwrap();
-        assert_eq!(
-            decoder.next_data().unwrap().unwrap(),
-            "{\n\"name\":\"签名\"}"
-        );
-        assert_eq!(decoder.next_data().unwrap().unwrap(), "second");
-        assert!(decoder.next_data().unwrap().is_none());
-    }
-
-    #[test]
-    fn oversized_sse_frames_are_rejected() {
-        let mut decoder = Decoder::default();
-        assert!(decoder.push(&vec![b'x'; MAX_EVENT_BYTES + 1]).is_err());
-    }
-
-    #[tokio::test]
-    async fn reconnects_after_limits_processing_failure_and_eof_with_same_tenant_token() {
-        use tokio::{
-            io::{AsyncReadExt, AsyncWriteExt},
-            net::TcpListener,
-        };
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            for attempt in 0..4 {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                while !request.ends_with(b"\r\n\r\n") {
-                    request.push(socket.read_u8().await.unwrap());
-                }
-                let request = String::from_utf8(request).unwrap();
-                assert!(request.starts_with("GET /lsp/events HTTP/1.1\r\n"));
-                assert!(
-                    request
-                        .to_lowercase()
-                        .contains("authorization: bearer tenant-token\r\n")
-                );
-                assert_eq!(
-                    request
-                        .to_lowercase()
-                        .contains("x-lsp-session-id: 0123456789abcdef0123456789abcdef\r\n"),
-                    attempt >= 2,
-                    "only the first accepted connection may take over the session"
-                );
-                let response = if attempt == 0 {
-                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
-                } else {
-                    let data = "event: lsp.future\ndata: {\"version\":1,\"type\":\"lsp.future\"}\n\n\
-                                event: lsp.snapshot_complete\ndata: {\"version\":1,\"type\":\"lsp.snapshot_complete\"}\n\n";
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Lsp-Session-Id: 0123456789abcdef0123456789abcdef\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}",
-                        data.len()
-                    )
-                };
-                socket.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-        let mut events =
-            EventStream::connect(&format!("http://{address}"), "tenant-token").unwrap();
-        for processed in [false, true, true] {
-            let delivery = tokio::time::timeout(Duration::from_secs(5), events.next())
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(matches!(delivery.event, LspEvent::SnapshotComplete));
-            delivery.processed.send(processed).unwrap();
-        }
-        drop(events);
-        server.await.unwrap();
-    }
-}
-
-#[cfg(test)]
-mod lifecycle_tests {
-    use super::*;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-    };
-
-    #[tokio::test]
-    async fn rejected_credentials_and_replaced_sessions_stop_without_reconnecting() {
-        for (status, message) in [(401, "凭证"), (403, "凭证"), (409, "接管")] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                while !request.ends_with(b"\r\n\r\n") {
-                    request.push(socket.read_u8().await.unwrap());
-                }
-                socket.write_all(format!(
-                    "HTTP/1.1 {status} Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                ).as_bytes()).await.unwrap();
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(600), listener.accept())
-                        .await
-                        .is_err()
-                );
-            });
-            let mut events = EventStream::connect(&url, "tenant-token").unwrap();
-            let error = tokio::time::timeout(Duration::from_secs(2), events.next())
-                .await
-                .unwrap()
-                .err()
-                .expect("terminal stream error");
-            assert!(error.to_string().contains(message));
-            assert!(events.next().await.is_err());
-            server.await.unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn dropping_reader_cancels_an_open_stream() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let mut events = EventStream::connect(&url, "tenant-token").unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                request.push(socket.read_u8().await.unwrap());
-            }
-            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Lsp-Session-Id: 0123456789abcdef0123456789abcdef\r\nConnection: close\r\n\r\ndata: {\"version\":1,\"type\":\"lsp.snapshot_complete\"}\n\n").await.unwrap();
-            let mut byte = [0];
-            assert_eq!(
-                tokio::time::timeout(Duration::from_secs(2), socket.read(&mut byte))
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                0
-            );
-        });
-        let delivery = events.next().await.unwrap();
-        delivery.processed.send(true).unwrap();
-        drop(events);
-        server.await.unwrap();
-    }
-}
+#[path = "test_events.rs"]
+pub(crate) mod tests;
