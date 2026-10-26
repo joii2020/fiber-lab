@@ -134,13 +134,6 @@ impl std::ops::Deref for ClientOptions {
     }
 }
 impl ClientOptions {
-    fn current_only(&self) -> Result<()> {
-        ensure!(
-            self.user.is_some() && self.round.is_none(),
-            "本命令必须使用 -u N 当前轮次；--round 和 --account 仅用于历史查询和恢复"
-        );
-        Ok(())
-    }
     fn recovery_selector(&self) -> String {
         self.user.map_or_else(
             || format!("--account {}", self.account.as_deref().unwrap()),
@@ -150,6 +143,14 @@ impl ClientOptions {
             },
         )
     }
+    fn recovery_command(&self, command: &str) -> String {
+        recovery_command(command, &self.recovery_selector(), &self.connection.rpc_url)
+    }
+}
+
+fn recovery_command(command: &str, selector: &str, rpc_url: &str) -> String {
+    let rpc_url = rpc_url.replace('\'', "'\\''");
+    format!("./lsp-cli {command} {selector} --rpc-url '{rpc_url}'")
 }
 
 #[derive(Subcommand)]
@@ -215,23 +216,7 @@ async fn run(cli: Cli) -> Result<()> {
             let (dir, _selection) =
                 accounts::choose(&accounts::root(), &options, false, true, false)?;
             let config = rpc::Connection::connect(&options.connection)?;
-            account::verify_local(&dir, &config).await?;
-            let local: serde_json::Value = dir.read_json()?;
-            println!("本地注册阶段：{}", local["registration"]);
-            if local["registration"] != "registered" {
-                println!("tenant_id：{}", local["tenant_id"]);
-                println!("尚未注册；通过 create-channel -u N 创建或恢复，不改变本地身份");
-                return Ok(());
-            }
-            let account = account::run_dir(&config, false, dir).await?;
-            println!(
-                "{}\n身份公钥：{}\ntenant_id：{}\n通道数量：{}",
-                account.outcome,
-                account.identity,
-                account.tenant_id,
-                channel::count(&account.channels)
-            );
-            channel::print_details(&account.client, &account.channels).await?;
+            account::status(&config, dir, &options).await?;
         }
     }
     Ok(())

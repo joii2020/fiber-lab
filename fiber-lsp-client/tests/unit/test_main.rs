@@ -62,7 +62,77 @@ fn historical_round_requires_fixed_account_and_recovery_preserves_round() {
         panic!()
     };
     assert_eq!(options.recovery_selector(), "-u 2 --round 3");
-    assert!(options.current_only().is_err());
+}
+
+#[test]
+fn recovery_commands_preserve_selection_and_shell_quote_url_without_credentials() {
+    let rpc_url = "https://lsp.example/rpc?name=O'Reilly&tag=$(printf changed)";
+    for (selector, commands) in [
+        (
+            vec!["-u", "2"],
+            vec!["status", "create-channel", "close-channel"],
+        ),
+        (
+            vec!["-u", "2", "--round", "3"],
+            vec!["status", "close-channel"],
+        ),
+        (
+            vec!["--account", "default"],
+            vec!["status", "close-channel"],
+        ),
+    ] {
+        let mut args = vec![
+            "lsp-cli",
+            "status",
+            "--rpc-url",
+            rpc_url,
+            "--token",
+            "bootstrap-secret",
+        ];
+        args.extend(selector);
+        let Some(Command::Status(options)) = Cli::try_parse_from(args).unwrap().command else {
+            panic!()
+        };
+        for command in commands {
+            let recovery = options.recovery_command(command);
+            assert!(!recovery.contains("bootstrap-secret"));
+            let output = std::process::Command::new("bash")
+                .args([
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    &format!("set -- {recovery}; printf '%s\\0' \"$@\""),
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let args: Vec<_> = output
+                .stdout
+                .split(|b| *b == 0)
+                .filter(|arg| !arg.is_empty())
+                .map(|arg| std::str::from_utf8(arg).unwrap())
+                .collect();
+            match Cli::try_parse_from(args).unwrap().command.unwrap() {
+                Command::Status(restored) => {
+                    assert_eq!(restored.user, options.user);
+                    assert_eq!(restored.account, options.account);
+                    assert_eq!(restored.round, options.round);
+                    assert_eq!(restored.connection.rpc_url, rpc_url);
+                }
+                Command::CloseChannel(restored) => {
+                    assert_eq!(restored.user, options.user);
+                    assert_eq!(restored.account, options.account);
+                    assert_eq!(restored.round, options.round);
+                    assert_eq!(restored.connection.rpc_url, rpc_url);
+                }
+                Command::CreateChannel(restored) => {
+                    assert_eq!(Some(restored.user), options.user);
+                    assert_eq!(restored.connection.rpc_url, rpc_url);
+                }
+                _ => panic!(),
+            }
+        }
+    }
 }
 
 #[test]

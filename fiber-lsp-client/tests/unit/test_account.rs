@@ -10,18 +10,44 @@ use serde_json::{Value, json};
 
 use super::*;
 
+pub(crate) fn options(config: &Connection, selected: Option<&str>) -> crate::ClientOptions {
+    crate::ClientOptions {
+        selector: crate::Selector {
+            user: None,
+            account: Some(selected.unwrap_or("default").into()),
+        },
+        round: None,
+        connection: crate::ConnectionOptions {
+            rpc_url: config.rpc_url.clone(),
+            ..Default::default()
+        },
+    }
+}
+
 pub(crate) async fn run(
     config: &Connection,
     create: bool,
     selected: Option<&str>,
 ) -> Result<AccountStatus> {
-    let dir = crate::accounts::tests::select(&config.root, selected, create)?;
+    let (dir, _selection) = crate::accounts::choose(
+        &config.root,
+        &options(config, selected),
+        false,
+        false,
+        false,
+    )?;
     run_dir(config, create, dir).await
 }
 
 impl ClientAccount {
     pub(crate) async fn load(config: &Connection, selected: Option<&str>) -> Result<Self> {
-        let dir = crate::accounts::tests::select(&config.root, selected, false)?;
+        let (dir, _selection) = crate::accounts::choose(
+            &config.root,
+            &options(config, selected),
+            false,
+            false,
+            false,
+        )?;
         Self::load_dir(config, dir).await
     }
 }
@@ -72,6 +98,13 @@ pub(crate) fn fixture() -> (tempfile::TempDir, Connection, TcpListener) {
         rpc_url: format!("http://{}", listener.local_addr().unwrap()),
         registration_token: Some(Zeroizing::new("operator-test-token".into())),
     };
+    let dir = AccountDir::lock(&config.account_dir()).unwrap();
+    atomic_write(
+        &dir.path.parent().unwrap().join("accounts.json"),
+        br#"{"version":1,"current":"default","accounts":[{"id":"default","archived":false}]}"#,
+    )
+    .unwrap();
+    drop(dir);
     fs::create_dir_all(root.path().join("configs/keys")).unwrap();
     fs::write(
         root.path().join("configs/keys/operator-token"),
@@ -174,6 +207,25 @@ pub(crate) fn serve(
 }
 
 #[tokio::test]
+async fn unregistered_status_is_offline_read_only_and_validates_identity() {
+    let (_root, config, _listener) = fixture();
+    let dir = AccountDir::lock(&config.account_dir()).unwrap();
+    initialize(&dir, &config).await.unwrap();
+    let before: Vec<_> = crate::store::ACCOUNT_FILES
+        .iter()
+        .map(|name| fs::read(dir.path.join(name)).unwrap())
+        .collect();
+    let options = options(&config, None);
+    status(&config, dir, &options).await.unwrap();
+    for (name, bytes) in crate::store::ACCOUNT_FILES.iter().zip(before) {
+        assert_eq!(fs::read(config.account_dir().join(name)).unwrap(), bytes);
+    }
+    let dir = AccountDir::lock(&config.account_dir()).unwrap();
+    atomic_write(&dir.path.join("root-key"), &[3; 32]).unwrap();
+    assert!(status(&config, dir, &options).await.is_err());
+}
+
+#[tokio::test]
 async fn interrupted_identity_registration_and_restore_use_the_same_account() {
     let (_root, mut config, listener) = fixture();
     config.registration_token = None;
@@ -244,7 +296,7 @@ async fn pending_registration_with_server_record_does_not_request_a_nonce() {
     );
     drop(dir);
     let error = run(&config, true, None).await.err().unwrap().to_string();
-    assert!(error.contains("不提供凭证找回"));
+    assert!(error.contains("CLI 尚未接入重新认证与凭证刷新"));
     assert_eq!(
         fs::read(config.account_dir().join("account.json")).unwrap(),
         original
@@ -315,7 +367,9 @@ async fn missing_registration_token_keeps_the_initial_identity() {
             .to_string()
             .contains("--token")
     );
-    let dir = crate::accounts::tests::select(&config.root, None, false).unwrap();
+    let (dir, _selection) =
+        crate::accounts::choose(&config.root, &options(&config, None), false, false, false)
+            .unwrap();
     let account_path = dir.path.clone();
     let record: AccountRecord = dir.read_json().unwrap();
     assert!(record.registration == Registration::IdentitySaved);

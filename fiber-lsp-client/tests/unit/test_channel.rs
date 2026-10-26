@@ -4,7 +4,12 @@ use ckb_types::core::TransactionBuilder;
 use serde_json::Value;
 
 async fn open_inner(options: &OpenOptions, account: &mut ClientAccount, rpc: &Rpc) -> Result<()> {
-    open_engine(options, account, rpc, None).await
+    let binding = crate::accounts::FundingBinding {
+        offckb_index: 6,
+        lock_script: crate::wallet::tests::terms().wallet_lock,
+        address: "test-wallet".into(),
+    };
+    open_engine(options, account, rpc, &binding).await
 }
 
 #[test]
@@ -103,11 +108,10 @@ async fn query_is_read_only_including_empty_and_local_pending_results() {
             ("list_channels", json!({"channels":[]})),
         ],
     );
-    let status = crate::account::tests::run(&config, false, None)
-        .await
-        .unwrap();
-    assert_eq!(count(&status.channels), "0");
-    print_details(&status.client, &status.channels)
+    let options = crate::account::tests::options(&config, None);
+    let (dir, _selection) =
+        crate::accounts::choose(&config.root, &options, false, true, false).unwrap();
+    crate::account::status(&config, dir, &options)
         .await
         .unwrap();
     server.join().unwrap();
@@ -136,8 +140,7 @@ async fn restored_amount_or_tenant_mismatch_stops_before_open_rpc() {
         ],
     );
     let options = OpenOptions {
-        account: None,
-        user: None,
+        user: 1,
         connection: crate::ConnectionOptions::default(),
         funding_amount: Some(1001 * CKB),
         timeout: 1,
@@ -491,8 +494,7 @@ async fn lost_opening_response_retains_pending_signer_and_original_request() {
     );
     let rpc = Rpc::new(&config.rpc_url).unwrap();
     let options = OpenOptions {
-        account: None,
-        user: None,
+        user: 1,
         connection: crate::ConnectionOptions::default(),
         funding_amount: None,
         timeout: 1,
@@ -634,12 +636,21 @@ async fn lost_shutdown_response_uses_remote_state_and_preserves_close_intent() {
     save_intent(&account.dir, &record).unwrap();
     let original = std::fs::read(account.dir.path.join("channel.json")).unwrap();
     drop(account);
-    let archived_id = crate::accounts::tests::archive(&config.root, None).unwrap();
-    let new_default = crate::accounts::tests::select(&config.root, None, true).unwrap();
+    // A saved v1 registry may contain an archived identity with an unfinished close.
+    atomic_write(
+        &config.account_dir().parent().unwrap().join("accounts.json"),
+        br#"{"version":1,"current":"account-01","accounts":[{"id":"default","archived":true},{"id":"account-01","archived":false}]}"#,
+    ).unwrap();
+    let new_default = AccountDir::lock(
+        &config
+            .account_dir()
+            .parent()
+            .unwrap()
+            .join("accounts/account-01"),
+    )
+    .unwrap();
     atomic_write(&new_default.path.join("root-key"), b"new-account-marker").unwrap();
-    let account = ClientAccount::load(&config, Some(&archived_id))
-        .await
-        .unwrap();
+    let account = ClientAccount::load(&config, Some("default")).await.unwrap();
     assert_eq!(
         read_intent(&account.dir).unwrap().unwrap().stage,
         Stage::CloseRequested

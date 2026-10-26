@@ -98,32 +98,7 @@ fn list_legacy(root: &Path) -> Result<()> {
     let registry = Registry::load(root)?;
     println!("账户 ID\t状态\ttenant_id\t当前状态");
     for entry in registry.accounts {
-        let dir = path(root, &entry.id);
-        let summary = (|| -> Result<(String, String)> {
-            let account: serde_json::Value =
-                serde_json::from_slice(&read_private(&dir.join("account.json"))?)?;
-            let mut stage = account["registration"]
-                .as_str()
-                .unwrap_or("未知")
-                .to_owned();
-            if dir.join("channel.json").try_exists()? {
-                let channel: serde_json::Value =
-                    serde_json::from_slice(&read_private(&dir.join("channel.json"))?)?;
-                stage = channel["stage"].as_str().unwrap_or("未知").to_owned();
-            }
-            if stage == "identity_saved" {
-                stage = "unregistered".to_owned();
-            }
-            Ok((
-                account["tenant_id"]
-                    .as_str()
-                    .unwrap_or("尚未保存")
-                    .to_owned(),
-                stage,
-            ))
-        })();
-        let (tenant, stage) =
-            summary.unwrap_or_else(|_| ("未知".into(), "记录缺失或损坏，待恢复".into()));
+        let (tenant, stage) = summary(&path(root, &entry.id));
         println!(
             "{}\t{}\t{tenant}\t{stage}",
             entry.id,
@@ -687,6 +662,15 @@ pub fn owner_for(root: &Path, id: &str) -> Result<Option<u8>> {
     }))
 }
 
+pub fn current_user_for(root: &Path, id: &str) -> Result<Option<u8>> {
+    Ok(UsersRegistry::load(root)?.and_then(|r| {
+        r.users
+            .into_iter()
+            .find(|u| u.current_account.as_deref() == Some(id))
+            .map(|u| u.number)
+    }))
+}
+
 pub fn funding_for(root: &Path, number: u8) -> Result<FundingBinding> {
     let registry =
         UsersRegistry::load(root)?.context("用户尚未初始化；执行 admin init-accounts")?;
@@ -701,7 +685,7 @@ pub fn funding_for(root: &Path, number: u8) -> Result<FundingBinding> {
 
 #[cfg(test)]
 #[path = "../tests/unit/test_accounts.rs"]
-pub(crate) mod tests;
+mod tests;
 
 #[cfg(test)]
 #[path = "../tests/unit/test_accounts_users.rs"]

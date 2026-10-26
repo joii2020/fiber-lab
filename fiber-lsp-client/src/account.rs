@@ -47,7 +47,7 @@ pub async fn run_dir(config: &Connection, create: bool, dir: AccountDir) -> Resu
     } else if create {
         initialize(&dir, config).await?
     } else {
-        bail!("账户不存在；请先执行 ./lsp-cli create-channel -u N");
+        bail!("账户不存在；{recovery}");
     };
     let rpc = Rpc::new(&config.rpc_url)?;
     let outcome = if record.registration == Registration::Registered {
@@ -63,6 +63,17 @@ pub async fn run_dir(config: &Connection, create: bool, dir: AccountDir) -> Resu
         register(&dir, config, &rpc, &mut record, &mut session).await?;
         "用户注册成功，账户已保存"
     };
+    registered_status(&rpc, dir, record, session, outcome, create).await
+}
+
+async fn registered_status(
+    rpc: &Rpc,
+    dir: AccountDir,
+    record: AccountRecord,
+    session: HostedSession<FileSignerStore>,
+    outcome: &'static str,
+    create: bool,
+) -> Result<AccountStatus> {
     let token = session
         .tenant_token()
         .context("账户缺少用户凭证；原数据已保留")?;
@@ -72,7 +83,10 @@ pub async fn run_dir(config: &Connection, create: bool, dir: AccountDir) -> Resu
         rpc.list_all_channels(token).await
     }
     .with_context(|| {
-        format!("查询通道失败；已保存的账户保持不变，可再次执行 ./lsp-cli status --account {id}")
+        let id = dir.path.file_name().unwrap().to_string_lossy();
+        let command =
+            crate::recovery_command("status", &format!("--account {id}"), &record.rpc_url);
+        format!("查询通道失败；已保存的账户保持不变，可再次执行 {command}")
     })?;
     Ok(AccountStatus {
         outcome,
@@ -216,7 +230,7 @@ async fn restore(
     if record.registration == Registration::Registered {
         if !has_token || record.lsp_public_key.is_none() || record.tenant.is_none() {
             bail!(
-                "已注册账户缺少用户凭证或 LSP/用户节点记录；原文件已保留。当前接口无法找回丢失的用户凭证"
+                "已注册账户缺少用户凭证或 LSP/用户节点记录；原文件已保留。当前 CLI 尚未接入重新认证与凭证刷新流程"
             );
         }
         validate_tenant(record.tenant.as_ref().unwrap(), &record)?;
@@ -266,7 +280,7 @@ async fn register(
         {
             validate_tenant(tenant, record)?;
             bail!(
-                "服务端已存在用户 {}，但本地缺少用户凭证。当前 LSP RPC 不提供凭证找回接口；不能重新注册。原身份与进度已保留",
+                "服务端已存在用户 {}，但本地缺少用户凭证。当前 CLI 尚未接入重新认证与凭证刷新流程；停止注册，原身份与进度已保留",
                 record.tenant_id
             );
         }
@@ -285,7 +299,7 @@ async fn register(
     dir.save_json(record)
         .context("保存等待注册结果的进度失败；未提交注册")?;
     let result = rpc.register(&operator, params).await.context(
-        "注册结果待核对；本地身份与进度已保留，未自动重发。再次执行 ./lsp-cli create-channel -u N 会先核对服务端记录",
+        "注册结果待核对；本地身份与进度已保留，未自动重发。再次执行原开通命令会先核对服务端记录",
     )?;
     validate_tenant(&result.tenant, record)
         .context("注册响应无效，结果待核对；本地身份与进度已保留")?;
@@ -299,7 +313,7 @@ async fn register(
     record.registration = Registration::Registered;
     record.session = session.state().clone();
     dir.save_json(record).context(
-        "注册已返回成功，但保存用户凭证失败，结果待核对；请保留账户文件。当前接口无法找回丢失的凭证",
+        "注册已返回成功，但保存用户凭证失败，结果待核对；请保留账户文件。当前 CLI 尚未接入重新认证与凭证刷新流程",
     )?;
     Ok(())
 }
@@ -315,15 +329,47 @@ pub async fn init_local(dir: &AccountDir, config: &Connection) -> Result<()> {
 }
 
 fn registration_recovery(config: &Connection, id: &str) -> Result<String> {
-    Ok(crate::accounts::owner_for(&config.root, id)?.map_or_else(
-        || "旧未绑定身份不能通过历史入口重新注册；保留资料核对原注册结果".into(),
-        |u| format!("执行 ./lsp-cli create-channel -u {u}，继续使用原 RPC 地址；注册未完成时默认复用本项目管理凭证，可用 --token 或 --token-file 覆盖"),
+    Ok(crate::accounts::current_user_for(&config.root, id)?.map_or_else(
+        || "历史或未绑定身份不能通过历史入口重新注册；保留资料核对原注册结果".into(),
+        |u| {
+            let command = crate::recovery_command("create-channel", &format!("-u {u}"), &config.rpc_url);
+            format!("执行 {command}；注册未完成时默认复用本项目管理凭证，可用 --token 或 --token-file 覆盖")
+        },
     ))
 }
 
-pub async fn verify_local(dir: &AccountDir, config: &Connection) -> Result<()> {
-    restore(dir, config).await?;
-    Ok(())
+pub async fn status(
+    config: &Connection,
+    dir: AccountDir,
+    options: &crate::ClientOptions,
+) -> Result<()> {
+    let (record, session) = restore(&dir, config).await?;
+    println!(
+        "本地注册阶段：{}",
+        serde_json::to_value(record.registration)?
+    );
+    if record.registration != Registration::Registered {
+        println!("tenant_id：{}", record.tenant_id);
+        if options.account.is_none() && options.round.is_none() {
+            println!(
+                "尚未注册；通过 {} 创建或恢复，不改变本地身份",
+                options.recovery_command("create-channel")
+            );
+        } else {
+            println!("尚未注册；当前 CLI 不支持通过历史入口重新注册，原身份与进度已保留");
+        }
+        return Ok(());
+    }
+    let rpc = Rpc::new(&config.rpc_url)?;
+    let account = registered_status(&rpc, dir, record, session, "已恢复原账户", false).await?;
+    println!(
+        "{}\n身份公钥：{}\ntenant_id：{}\n通道数量：{}",
+        account.outcome,
+        account.identity,
+        account.tenant_id,
+        crate::channel::count(&account.channels)
+    );
+    crate::channel::print_details(&account.client, &account.channels, options).await
 }
 
 #[cfg(test)]

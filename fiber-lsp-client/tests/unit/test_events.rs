@@ -10,6 +10,8 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
 const CHANNEL_ID: Hash256 = Hash256([4; 32]);
 
+// tungstenite requires an unboxed ErrorResponse in the handshake callback.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn accept(
     socket: TcpStream,
     token: &str,

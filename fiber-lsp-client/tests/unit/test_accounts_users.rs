@@ -144,6 +144,7 @@ async fn archive_requires_exact_closed_evidence_and_next_round_preserves_owner()
     let (dir, selected) =
         choose(temp.path(), &options(Some(1), None), false, false, false).unwrap();
     let id = selected.id.clone();
+    assert_eq!(current_user_for(temp.path(), &id).unwrap(), Some(1));
     let channel = fiber_json_types::Hash256([3; 32]);
     let hash = ckb_types::H256::from([4; 32]);
     atomic_write(&dir.path.join("channel.json"), &serde_json::to_vec(&serde_json::json!({"stage":"closing","close_hash":hash,"opening":{"channel_id":channel}})).unwrap()).unwrap();
@@ -158,6 +159,8 @@ async fn archive_requires_exact_closed_evidence_and_next_round_preserves_owner()
     atomic_write(&path(temp.path(),&id).join("channel.json"), &serde_json::to_vec(&serde_json::json!({"stage":"closed","close_hash":hash,"opening":{"channel_id":channel}})).unwrap()).unwrap();
     archive_verified(temp.path(), &selected, channel, &hash).unwrap();
     archive_verified(temp.path(), &selected, channel, &hash).unwrap();
+    assert_eq!(owner_for(temp.path(), &id).unwrap(), Some(1));
+    assert_eq!(current_user_for(temp.path(), &id).unwrap(), None);
     drop(selected);
     let before = fs::read(base(temp.path()).join("accounts.json")).unwrap();
     assert!(choose(temp.path(), &options(Some(1), None), false, false, false).is_err());
@@ -168,6 +171,8 @@ async fn archive_requires_exact_closed_evidence_and_next_round_preserves_owner()
     init_users(&cfg, bindings()).await.unwrap();
     let (dir, next) = choose(temp.path(), &options(Some(1), None), true, false, true).unwrap();
     assert_ne!(next.id, id);
+    assert_eq!(current_user_for(temp.path(), &next.id).unwrap(), Some(1));
+    assert_eq!(current_user_for(temp.path(), &id).unwrap(), None);
     crate::account::init_local(&dir, &cfg).await.unwrap();
     let registry = UsersRegistry::load(temp.path()).unwrap().unwrap();
     assert!(
