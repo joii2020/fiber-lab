@@ -238,5 +238,5 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 #[cfg(test)]
-#[path = "test_main.rs"]
+#[path = "../tests/unit/test_main.rs"]
 mod tests;

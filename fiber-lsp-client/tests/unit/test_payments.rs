@@ -1,8 +1,5 @@
 use super::*;
-use crate::account::{
-    test_registered,
-    tests::{fixture, serve},
-};
+use crate::account::tests::{fixture, serve, test_registered};
 use fiber_types::Privkey;
 use std::fs;
 
@@ -14,15 +11,21 @@ fn receipt_timing_starts_only_for_its_own_inbound_tlc_and_never_restarts() {
     receipt.observe_tlc(Hash256([2; 32]), true);
     receipt.observe_tlc(hash, false);
     assert!(receipt.processing.is_none());
-    assert_eq!(crate::timings::calls("payment.wait_for_receipt"), 0);
+    assert_eq!(crate::timings::tests::calls("payment.wait_for_receipt"), 0);
     receipt.observe_tlc(hash, true);
     assert!(receipt.processing.is_some());
     assert!(receipt.waiting.is_none());
-    assert_eq!(crate::timings::calls("payment.wait_for_receipt"), 1);
+    assert_eq!(crate::timings::tests::calls("payment.wait_for_receipt"), 1);
     receipt.observe_tlc(hash, true);
-    assert_eq!(crate::timings::calls("payment.receipt_processing"), 0);
+    assert_eq!(
+        crate::timings::tests::calls("payment.receipt_processing"),
+        0
+    );
     receipt.finish(true);
-    assert_eq!(crate::timings::calls("payment.receipt_processing"), 1);
+    assert_eq!(
+        crate::timings::tests::calls("payment.receipt_processing"),
+        1
+    );
     crate::timings::enable(false);
 }
 
@@ -36,7 +39,7 @@ async fn operation(account: &mut ClientAccount, inbound: bool) -> Operation {
         .bindings
         .insert(id, account.session.pending_channel_key_id().unwrap());
     // HostedSession owns the root; reload it with the persisted directory.
-    crate::account::save_test_state(&account.dir, &state);
+    crate::account::tests::save_test_state(&account.dir, &state);
     let preimage = Hash256([5; 32]);
     let hash = Hash256(HashAlgorithm::CkbHash.hash(preimage.0));
     let expires = now_ms().unwrap() + 3_600_000;

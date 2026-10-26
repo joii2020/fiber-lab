@@ -815,5 +815,5 @@ fn reconcile(
 }
 
 #[cfg(test)]
-#[path = "test_payments.rs"]
+#[path = "../tests/unit/test_payments.rs"]
 mod tests;

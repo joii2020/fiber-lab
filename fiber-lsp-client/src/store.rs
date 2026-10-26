@@ -20,6 +20,21 @@ pub struct AccountDir {
 
 impl AccountDir {
     pub fn lock(path: &Path) -> Result<Self> {
+        let dir = Self::open(path)?;
+        dir._lock
+            .try_lock()
+            .context("账户正在被其他进程使用，或无法锁定；请稍后重试")?;
+        Ok(dir)
+    }
+
+    /// Wait only for short, local registry updates; account locks stay nonblocking.
+    pub fn lock_wait(path: &Path) -> Result<Self> {
+        let dir = Self::open(path)?;
+        dir._lock.lock().context("无法锁定共享账户索引")?;
+        Ok(dir)
+    }
+
+    fn open(path: &Path) -> Result<Self> {
         let parent = path.parent().context("账户目录缺少父目录")?;
         private_dir(parent)?;
         private_dir(path)?;
@@ -35,8 +50,6 @@ impl AccountDir {
             .mode(0o600)
             .open(&lock_path)
             .with_context(|| format!("无法打开账户锁 {}", lock_path.display()))?;
-        lock.try_lock()
-            .context("账户正在被其他进程使用，或无法锁定；请稍后重试")?;
         Ok(Self {
             path: path.to_path_buf(),
             _lock: lock,
@@ -291,5 +304,5 @@ impl SignerStore for FileSignerStore {
 }
 
 #[cfg(test)]
-#[path = "test_store.rs"]
+#[path = "../tests/unit/test_store.rs"]
 mod tests;

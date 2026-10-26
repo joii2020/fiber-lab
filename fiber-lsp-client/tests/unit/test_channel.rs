@@ -1,10 +1,11 @@
 use super::*;
-use crate::account::{
-    test_registered,
-    tests::{fixture, serve},
-};
+use crate::account::tests::{fixture, serve, test_registered};
 use ckb_types::core::TransactionBuilder;
 use serde_json::Value;
+
+async fn open_inner(options: &OpenOptions, account: &mut ClientAccount, rpc: &Rpc) -> Result<()> {
+    open_engine(options, account, rpc, None).await
+}
 
 #[test]
 fn amounts_use_integer_arithmetic_and_reject_overflow_and_extra_precision() {
@@ -102,7 +103,9 @@ async fn query_is_read_only_including_empty_and_local_pending_results() {
             ("list_channels", json!({"channels":[]})),
         ],
     );
-    let status = crate::account::run(&config, false, None).await.unwrap();
+    let status = crate::account::tests::run(&config, false, None)
+        .await
+        .unwrap();
     assert_eq!(count(&status.channels), "0");
     print_details(&status.client, &status.channels)
         .await
@@ -631,8 +634,8 @@ async fn lost_shutdown_response_uses_remote_state_and_preserves_close_intent() {
     save_intent(&account.dir, &record).unwrap();
     let original = std::fs::read(account.dir.path.join("channel.json")).unwrap();
     drop(account);
-    let archived_id = crate::accounts::archive(&config.root, None).unwrap();
-    let new_default = crate::accounts::select(&config.root, None, true).unwrap();
+    let archived_id = crate::accounts::tests::archive(&config.root, None).unwrap();
+    let new_default = crate::accounts::tests::select(&config.root, None, true).unwrap();
     atomic_write(&new_default.path.join("root-key"), b"new-account-marker").unwrap();
     let account = ClientAccount::load(&config, Some(&archived_id))
         .await

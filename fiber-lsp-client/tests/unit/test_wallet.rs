@@ -1,4 +1,7 @@
 use super::*;
+
+const CLIENT_FUNDING_ACCOUNT: usize = 6;
+
 pub fn terms() -> Terms {
     let key = secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
     let hash = ckb_hash::blake2b_256(key.public_key(secp256k1::SECP256K1).serialize());

@@ -279,10 +279,6 @@ async fn open_bound(
     }
     open_engine(options, account, rpc, Some(binding)).await
 }
-#[cfg(test)]
-async fn open_inner(options: &OpenOptions, account: &mut ClientAccount, rpc: &Rpc) -> Result<()> {
-    open_engine(options, account, rpc, None).await
-}
 
 async fn open_engine(
     options: &OpenOptions,
@@ -1170,5 +1166,5 @@ pub fn settled_balances(records: &[fiber_lsp_sdk::RecoveryRecord]) -> Result<(u1
 }
 
 #[cfg(test)]
-#[path = "test_channel.rs"]
+#[path = "../tests/unit/test_channel.rs"]
 pub(crate) mod tests;

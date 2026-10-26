@@ -39,16 +39,6 @@ pub struct AccountStatus {
     pub channels: Vec<fiber_json_types::Channel>,
 }
 
-#[cfg(test)]
-pub async fn run(
-    config: &Connection,
-    create: bool,
-    selected: Option<&str>,
-) -> Result<AccountStatus> {
-    let dir = crate::accounts::select(&config.root, selected, create)?;
-    run_dir(config, create, dir).await
-}
-
 pub async fn run_dir(config: &Connection, create: bool, dir: AccountDir) -> Result<AccountStatus> {
     let id = dir.path.file_name().unwrap().to_string_lossy();
     let recovery = registration_recovery(config, &id)?;
@@ -111,12 +101,6 @@ pub struct ClientAccount {
 }
 
 impl ClientAccount {
-    #[cfg(test)]
-    pub async fn load(config: &Connection, selected: Option<&str>) -> Result<Self> {
-        let dir = crate::accounts::select(&config.root, selected, false)?;
-        Self::load_dir(config, dir).await
-    }
-
     pub async fn load_dir(config: &Connection, dir: AccountDir) -> Result<Self> {
         let _timing = crate::timings::Span::new("cli.account_restore");
         let id = dir.path.file_name().unwrap().to_string_lossy();
@@ -320,46 +304,6 @@ async fn register(
     Ok(())
 }
 
-#[cfg(test)]
-pub async fn test_registered(config: &Connection) -> ClientAccount {
-    let dir = AccountDir::lock(&config.account_dir()).unwrap();
-    let (mut record, mut session) = initialize(&dir, config).await.unwrap();
-    let lsp_public_key = Pubkey(RootKey::import([2; 32]).unwrap().public_key().serialize());
-    let tenant = serde_json::from_value(serde_json::json!({
-        "tenant_id": record.tenant_id, "root_signer_pubkey": record.identity_public_key,
-        "invoice_pubkey": record.identity_public_key, "private_channel_id": null,
-        "created_at": "0x1", "runtime_status": "cold", "channel_online": false,
-    }))
-    .unwrap();
-    session
-        .finish_registration(fiber_json_types::RegisterLspTenantResult {
-            tenant,
-            access_token: "user-test-token".into(),
-        })
-        .unwrap();
-    record.lsp_public_key = Some(lsp_public_key);
-    record.tenant = serde_json::from_value(serde_json::json!({
-        "tenant_id": record.tenant_id, "root_signer_pubkey": record.identity_public_key,
-        "invoice_pubkey": record.identity_public_key, "private_channel_id": null,
-        "created_at": "0x1", "runtime_status": "cold", "channel_online": false,
-    }))
-    .unwrap();
-    record.registration = Registration::Registered;
-    record.session = session.state().clone();
-    dir.save_json(&record).unwrap();
-    ClientAccount {
-        dir,
-        session,
-        lsp_public_key,
-        invoice_public_key: record.identity_public_key,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn save_test_state(dir: &AccountDir, state: &HostedSessionState) {
-    save_session(dir, state).unwrap();
-}
-
 /// Offline identity initialization; partial files are never replaced.
 pub async fn init_local(dir: &AccountDir, config: &Connection) -> Result<()> {
     if dir.is_initialized()? {
@@ -383,5 +327,5 @@ pub async fn verify_local(dir: &AccountDir, config: &Connection) -> Result<()> {
 }
 
 #[cfg(test)]
-#[path = "test_account.rs"]
+#[path = "../tests/unit/test_account.rs"]
 pub(crate) mod tests;

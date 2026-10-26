@@ -18,8 +18,6 @@ pub const CKB: u64 = 100_000_000;
 pub const FEE_RATE: u64 = 1000;
 pub const MAX_FEE: u64 = CKB;
 pub const RESERVE: u64 = 99 * CKB;
-#[cfg(test)]
-pub const CLIENT_FUNDING_ACCOUNT: usize = 6;
 const LSP_FUNDING_ACCOUNT: usize = 5;
 
 #[derive(Deserialize)]
@@ -753,5 +751,5 @@ pub fn public_binding(index: usize) -> Result<crate::accounts::FundingBinding> {
 }
 
 #[cfg(test)]
-#[path = "test_wallet.rs"]
+#[path = "../tests/unit/test_wallet.rs"]
 pub(crate) mod tests;

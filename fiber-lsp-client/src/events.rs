@@ -170,5 +170,5 @@ async fn receive(
 }
 
 #[cfg(test)]
-#[path = "test_events.rs"]
+#[path = "../tests/unit/test_events.rs"]
 pub(crate) mod tests;

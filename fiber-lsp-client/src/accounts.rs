@@ -92,80 +92,6 @@ impl Registry {
         );
         Ok(registry)
     }
-    #[cfg(test)]
-    fn save(&self, root: &Path) -> Result<()> {
-        atomic_write(
-            &base(root).join("accounts.json"),
-            &serde_json::to_vec_pretty(self)?,
-        )
-    }
-}
-
-/// Lock order is registry -> account. The registry lock is released before RPC.
-#[cfg(test)]
-pub fn select(root: &Path, requested: Option<&str>, create: bool) -> Result<AccountDir> {
-    let _registry_lock = AccountDir::lock(&base(root).join(".registry"))?;
-    let mut registry = Registry::load(root)?;
-    let mut newly_allocated = false;
-    let id = if let Some(id) = requested {
-        ensure!(
-            registry.accounts.iter().any(|e| e.id == id),
-            "未知账户 {id}；请执行 ./lsp-cli list-accounts"
-        );
-        id.to_owned()
-    } else if let Some(id) = &registry.current {
-        id.clone()
-    } else {
-        ensure!(
-            create,
-            "当前没有默认账户；请执行 ./lsp-cli create-user，或用 --account ID 选择历史账户"
-        );
-        let id = format!(
-            "account-{:x}",
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        );
-        ensure!(!path(root, &id).try_exists()?, "新账户目录已存在；请重试");
-        newly_allocated = true;
-        registry.accounts.push(Entry {
-            id: id.clone(),
-            archived: false,
-        });
-        registry.current = Some(id.clone());
-        id
-    };
-    let account_path = path(root, &id);
-    // Existing entries must never silently recreate a missing directory.
-    ensure!(
-        account_path.try_exists()? || (create && requested.is_none() && newly_allocated),
-        "账户 {id} 目录缺失；原清单已保留"
-    );
-    let dir = AccountDir::lock(&account_path)?;
-    registry.save(root)?;
-    println!("账户 ID：{id}");
-    Ok(dir)
-}
-
-#[cfg(test)]
-pub fn archive(root: &Path, requested: Option<&str>) -> Result<String> {
-    let _registry_lock = AccountDir::lock(&base(root).join(".registry"))?;
-    let mut registry = Registry::load(root)?;
-    let id = requested
-        .or(registry.current.as_deref())
-        .context("当前没有默认账户；请执行 ./lsp-cli list-accounts")?
-        .to_owned();
-    let entry = registry
-        .accounts
-        .iter_mut()
-        .find(|e| e.id == id)
-        .context("未知账户；请执行 ./lsp-cli list-accounts")?;
-    ensure!(path(root, &id).try_exists()?, "账户目录缺失；原清单已保留");
-    let _account_lock = AccountDir::lock(&path(root, &id))?;
-    entry.archived = true;
-    if registry.current.as_deref() == Some(&id) {
-        registry.current = None;
-    }
-    registry.save(root)?;
-    Ok(id)
 }
 
 fn list_legacy(root: &Path) -> Result<()> {
@@ -210,10 +136,6 @@ fn list_legacy(root: &Path) -> Result<()> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "test_accounts.rs"]
-mod tests;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -371,7 +293,6 @@ pub struct Selection {
     pub funding: Option<FundingBinding>,
     historical: bool,
     _user_lock: Option<AccountDir>,
-    _opening_lock: Option<AccountDir>,
 }
 pub fn choose(
     root: &Path,
@@ -397,10 +318,8 @@ pub fn choose(
         .user
         .map(|u| AccountDir::lock(&base(root).join(format!(".user-{u}"))))
         .transpose()?;
-    let opening_lock = create
-        .then(|| AccountDir::lock(&base(root).join(".opening")))
-        .transpose()?;
-    let _registry_lock = AccountDir::lock(&base(root).join(".registry"))?;
+    // Serialize registry access only; different users continue independently after selection.
+    let _registry_lock = AccountDir::lock_wait(&base(root).join(".registry"))?;
     let loaded = UsersRegistry::load(root)?;
     let mut newly_reserved = false;
     let mut reserved_dir = None;
@@ -499,7 +418,6 @@ pub fn choose(
             funding,
             historical: options.account.is_some() || options.round.is_some(),
             _user_lock: user_lock,
-            _opening_lock: opening_lock,
         },
     ))
 }
@@ -534,7 +452,7 @@ fn archive_with_write(
     hash: &ckb_types::H256,
     write: impl FnOnce(&Path, &[u8]) -> Result<()>,
 ) -> Result<()> {
-    let _registry_lock = AccountDir::lock(&base(root).join(".registry"))?;
+    let _registry_lock = AccountDir::lock_wait(&base(root).join(".registry"))?;
     let _account_lock = AccountDir::lock(&path(root, &selection.id))?;
     let value: serde_json::Value = serde_json::from_slice(&read_private(
         &path(root, &selection.id).join("channel.json"),
@@ -616,7 +534,7 @@ pub async fn init_users(
     let _user_locks = (1..=4)
         .map(|u| AccountDir::lock(&base(&config.root).join(format!(".user-{u}"))))
         .collect::<Result<Vec<_>>>()?;
-    let _registry_lock = AccountDir::lock(&base(&config.root).join(".registry"))?;
+    let _registry_lock = AccountDir::lock_wait(&base(&config.root).join(".registry"))?;
     let mut registry = if let Some(registry) = UsersRegistry::load(&config.root)? {
         ensure!(
             registry
@@ -782,5 +700,9 @@ pub fn funding_for(root: &Path, number: u8) -> Result<FundingBinding> {
 }
 
 #[cfg(test)]
-#[path = "test_accounts_users.rs"]
+#[path = "../tests/unit/test_accounts.rs"]
+pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/test_accounts_users.rs"]
 mod user_tests;

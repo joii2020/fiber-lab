@@ -1,5 +1,11 @@
 use super::*;
 
+impl Connection {
+    pub(crate) fn account_dir(&self) -> PathBuf {
+        self.root.join(".state/fiber-lsp-client/default")
+    }
+}
+
 #[test]
 fn rejects_mismatched_response_and_redacts_server_errors() {
     assert!(

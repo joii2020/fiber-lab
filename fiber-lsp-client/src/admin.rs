@@ -300,7 +300,7 @@ fn read_keypair(key_path: &Path) -> Result<KeyPair> {
 }
 
 #[cfg(test)]
-#[path = "test_admin.rs"]
+#[path = "../tests/unit/test_admin.rs"]
 mod tests;
 
 /// Initialize local identities and wallet bindings without accessing server files or RPC.

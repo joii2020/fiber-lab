@@ -346,10 +346,5 @@ fn human_report(metrics: &BTreeMap<String, Metric>, success: bool) -> String {
 }
 
 #[cfg(test)]
-pub fn calls(name: &str) -> u64 {
-    STATE.with_borrow(|state| state.metrics.get(name).map_or(0, |metric| metric.calls))
-}
-
-#[cfg(test)]
-#[path = "test_timings.rs"]
-mod tests;
+#[path = "../tests/unit/test_timings.rs"]
+pub(crate) mod tests;

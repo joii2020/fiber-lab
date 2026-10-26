@@ -10,6 +10,60 @@ use serde_json::{Value, json};
 
 use super::*;
 
+pub(crate) async fn run(
+    config: &Connection,
+    create: bool,
+    selected: Option<&str>,
+) -> Result<AccountStatus> {
+    let dir = crate::accounts::tests::select(&config.root, selected, create)?;
+    run_dir(config, create, dir).await
+}
+
+impl ClientAccount {
+    pub(crate) async fn load(config: &Connection, selected: Option<&str>) -> Result<Self> {
+        let dir = crate::accounts::tests::select(&config.root, selected, false)?;
+        Self::load_dir(config, dir).await
+    }
+}
+
+pub(crate) async fn test_registered(config: &Connection) -> ClientAccount {
+    let dir = AccountDir::lock(&config.account_dir()).unwrap();
+    let (mut record, mut session) = initialize(&dir, config).await.unwrap();
+    let lsp_public_key = Pubkey(RootKey::import([2; 32]).unwrap().public_key().serialize());
+    let tenant = serde_json::from_value(serde_json::json!({
+        "tenant_id": record.tenant_id, "root_signer_pubkey": record.identity_public_key,
+        "invoice_pubkey": record.identity_public_key, "private_channel_id": null,
+        "created_at": "0x1", "runtime_status": "cold", "channel_online": false,
+    }))
+    .unwrap();
+    session
+        .finish_registration(fiber_json_types::RegisterLspTenantResult {
+            tenant,
+            access_token: "user-test-token".into(),
+        })
+        .unwrap();
+    record.lsp_public_key = Some(lsp_public_key);
+    record.tenant = serde_json::from_value(serde_json::json!({
+        "tenant_id": record.tenant_id, "root_signer_pubkey": record.identity_public_key,
+        "invoice_pubkey": record.identity_public_key, "private_channel_id": null,
+        "created_at": "0x1", "runtime_status": "cold", "channel_online": false,
+    }))
+    .unwrap();
+    record.registration = Registration::Registered;
+    record.session = session.state().clone();
+    dir.save_json(&record).unwrap();
+    ClientAccount {
+        dir,
+        session,
+        lsp_public_key,
+        invoice_public_key: record.identity_public_key,
+    }
+}
+
+pub(crate) fn save_test_state(dir: &AccountDir, state: &HostedSessionState) {
+    save_session(dir, state).unwrap();
+}
+
 pub(crate) fn fixture() -> (tempfile::TempDir, Connection, TcpListener) {
     let root = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -261,7 +315,7 @@ async fn missing_registration_token_keeps_the_initial_identity() {
             .to_string()
             .contains("--token")
     );
-    let dir = crate::accounts::select(&config.root, None, false).unwrap();
+    let dir = crate::accounts::tests::select(&config.root, None, false).unwrap();
     let account_path = dir.path.clone();
     let record: AccountRecord = dir.read_json().unwrap();
     assert!(record.registration == Registration::IdentitySaved);

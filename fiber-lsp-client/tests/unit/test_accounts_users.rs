@@ -97,8 +97,8 @@ async fn user_and_account_locks_block_competitors_and_queries_do_not_save() {
     let temp = tempfile::tempdir().unwrap();
     init_users(&config(temp.path()), bindings()).await.unwrap();
     let before = fs::read(base(temp.path()).join("accounts.json")).unwrap();
-    let (dir, selected) =
-        choose(temp.path(), &options(Some(1), None), false, false, false).unwrap();
+    let (dir, selected) = choose(temp.path(), &options(Some(1), None), true, false, true).unwrap();
+    assert!(choose(temp.path(), &options(Some(1), None), true, false, true).is_err());
     assert!(choose(temp.path(), &options(Some(1), None), false, false, false).is_err());
     assert!(
         choose(
@@ -110,7 +110,7 @@ async fn user_and_account_locks_block_competitors_and_queries_do_not_save() {
         )
         .is_err()
     );
-    let other = choose(temp.path(), &options(Some(2), None), false, false, false).unwrap();
+    let other = choose(temp.path(), &options(Some(2), None), true, false, true).unwrap();
     assert_ne!(dir.path, other.0.path);
     assert!(check_historical_close(temp.path(), &other.1).is_ok());
     drop(other);
@@ -234,25 +234,97 @@ async fn complete_account_directory_loss_or_owner_transfer_is_rejected() {
     assert!(!path(temp.path(), &id).exists());
 }
 #[tokio::test]
-async fn opening_lock_rejects_other_user_without_allocating_identity() {
+async fn concurrent_users_wait_for_registry_and_preserve_all_reservations_and_archives() {
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::time::Duration;
+
     let temp = tempfile::tempdir().unwrap();
     init_users(&config(temp.path()), bindings()).await.unwrap();
     let mut registry = UsersRegistry::load(temp.path()).unwrap().unwrap();
-    let id = registry.users[1].current_account.take().unwrap();
-    registry
-        .accounts
-        .iter_mut()
-        .find(|e| e.id == id)
-        .unwrap()
-        .archived = true;
+    for user in &mut registry.users {
+        user.current_account = None;
+    }
+    for entry in &mut registry.accounts {
+        entry.archived = true;
+    }
     registry.save(temp.path()).unwrap();
     let before = fs::read(base(temp.path()).join("accounts.json")).unwrap();
-    let _opening = AccountDir::lock(&base(temp.path()).join(".opening")).unwrap();
-    assert!(choose(temp.path(), &options(Some(2), None), true, false, true).is_err());
-    assert_eq!(
-        fs::read(base(temp.path()).join("accounts.json")).unwrap(),
-        before
-    );
+    let registry_lock = AccountDir::lock_wait(&base(temp.path()).join(".registry")).unwrap();
+    let start = Arc::new(Barrier::new(5));
+    let (done_tx, done_rx) = mpsc::channel();
+    let root = temp.path();
+    let (early_result, while_waiting, selections) = std::thread::scope(|scope| {
+        let workers: Vec<_> = (1..=4)
+            .map(|number| {
+                let start = Arc::clone(&start);
+                let done = done_tx.clone();
+                scope.spawn(move || {
+                    start.wait();
+                    let result = choose(root, &options(Some(number), None), true, false, true);
+                    done.send(()).unwrap();
+                    result
+                })
+            })
+            .collect();
+        start.wait();
+        let early = done_rx.recv_timeout(Duration::from_millis(100));
+        let while_waiting = fs::read(base(root).join("accounts.json"));
+        drop(registry_lock);
+        let selections: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect();
+        (early, while_waiting, selections)
+    });
+    assert_eq!(early_result, Err(mpsc::RecvTimeoutError::Timeout));
+    assert_eq!(while_waiting.unwrap(), before);
+    let registry = UsersRegistry::load(root).unwrap().unwrap();
+    assert_eq!(registry.accounts.len(), 8);
+    for (dir, selection) in &selections {
+        let number = selection.user.unwrap();
+        let user = registry.users.iter().find(|u| u.number == number).unwrap();
+        assert_eq!(user.current_account.as_ref(), Some(&selection.id));
+        assert_eq!(dir.path, path(root, &selection.id));
+        assert_eq!(selection.funding.as_ref(), Some(&user.funding));
+    }
+
+    let start = Arc::new(Barrier::new(4));
+    let channel = fiber_json_types::Hash256([3; 32]);
+    let hash = ckb_types::H256::from([4; 32]);
+    let archived: Vec<_> = std::thread::scope(|scope| {
+        let workers: Vec<_> = selections
+            .into_iter()
+            .map(|(dir, selection)| {
+                let start = Arc::clone(&start);
+                let hash = hash.clone();
+                scope.spawn(move || -> Result<_> {
+                    start.wait();
+                    atomic_write(
+                        &dir.path.join("channel.json"),
+                        &serde_json::to_vec(&serde_json::json!({
+                            "stage": "closed", "close_hash": hash,
+                            "opening": { "channel_id": channel }
+                        }))?,
+                    )?;
+                    drop(dir);
+                    archive_verified(root, &selection, channel, &hash)?;
+                    Ok((selection.user.unwrap(), selection.id.clone()))
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect()
+    });
+    let registry = UsersRegistry::load(root).unwrap().unwrap();
+    assert_eq!(registry.accounts.len(), 8);
+    assert!(registry.accounts.iter().all(|entry| entry.archived));
+    for (number, id) in archived {
+        let user = registry.users.iter().find(|u| u.number == number).unwrap();
+        assert!(user.current_account.is_none());
+        assert_eq!(user.last_closed_account.as_ref(), Some(&id));
+    }
 }
 #[tokio::test]
 async fn failed_archive_save_keeps_pointer_and_retry_archives_exactly_once() {

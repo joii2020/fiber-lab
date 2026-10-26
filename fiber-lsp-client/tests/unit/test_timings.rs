@@ -1,5 +1,9 @@
 use super::*;
 
+pub(crate) fn calls(name: &str) -> u64 {
+    STATE.with_borrow(|state| state.metrics.get(name).map_or(0, |metric| metric.calls))
+}
+
 #[test]
 fn payment_steps_keep_observation_order_and_ignore_replays() {
     enable(true);

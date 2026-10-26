@@ -90,11 +90,6 @@ impl Connection {
         );
         Ok(Zeroizing::new(token.trim().to_owned()))
     }
-
-    #[cfg(test)]
-    pub fn account_dir(&self) -> PathBuf {
-        self.root.join(".state/fiber-lsp-client/default")
-    }
 }
 
 pub struct Rpc {
@@ -303,5 +298,5 @@ impl fiber_lsp_sdk::TenantOpeningRpc for Rpc {
 }
 
 #[cfg(test)]
-#[path = "test_rpc.rs"]
+#[path = "../tests/unit/test_rpc.rs"]
 mod tests;
