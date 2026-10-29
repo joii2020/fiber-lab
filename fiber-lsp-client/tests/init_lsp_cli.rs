@@ -40,7 +40,8 @@ impl Fixture {
         fs::create_dir(config.parent().unwrap()).unwrap();
         fs::write(&config, CONFIG).unwrap();
         fs::set_permissions(&config, fs::Permissions::from_mode(0o640)).unwrap();
-        let private = config.parent().unwrap().join("biscuit-private-key");
+        let private = config.parent().unwrap().join("biscuit/private.key");
+        fs::create_dir(private.parent().unwrap()).unwrap();
         Self {
             temp,
             config,
@@ -283,7 +284,7 @@ fn default_path_uses_xdg_and_config_symlinks_are_rejected() {
         config
             .parent()
             .unwrap()
-            .join("biscuit-private-key")
+            .join("biscuit/private.key")
             .exists()
     );
     let target = fixture.config.with_extension("real");

@@ -19,7 +19,7 @@ pub const PERMISSIONS: &str = "read(\"lsp\"); write(\"lsp\"); read(\"node\");";
 
 #[derive(Args)]
 #[command(
-    after_help = "离线修改 offckb 已生成的节点配置，不启动节点。\n保留其他配置字段；YAML 注释和排版会重新生成。已有密钥复用，冲突时拒绝修改。"
+    after_help = "离线修改 offckb 已生成的节点配置，不启动节点。\n保留其他配置字段，以兼容 YAML 的 JSON 保存，原注释和排版不保留。已有密钥复用，冲突时拒绝修改。"
 )]
 pub struct InitLsp {
     /// 配置路径；默认 offckb Node3 的 config.yml
@@ -95,7 +95,7 @@ pub fn init_lsp(options: &InitLsp) -> Result<InitializedLsp> {
         None => config
             .parent()
             .context("配置路径缺少父目录")?
-            .join("biscuit-private-key"),
+            .join("biscuit/private.key"),
     })?;
     let (key, new_key) = match fs::symlink_metadata(&key_path) {
         Ok(_) => (read_keypair(&key_path)?, false),
@@ -119,7 +119,8 @@ pub fn init_lsp(options: &InitLsp) -> Result<InitializedLsp> {
         "biscuit_private_key_path".into(),
         key_path.to_str().context("私钥路径必须是 UTF-8")?.into(),
     );
-    let yaml = serde_yaml::to_string(&document).context("无法编码 LSP 配置")?;
+    // JSON is valid YAML and quotes hex strings that JS YAML readers otherwise parse as numbers.
+    let yaml = serde_json::to_string_pretty(&document).context("无法编码 LSP 配置")?;
     // Prepare the configuration before creating the key. Keep the original config permissions.
     let mut temp = tempfile::NamedTempFile::new_in(config.parent().unwrap())?;
     temp.as_file().set_permissions(metadata.permissions())?;
